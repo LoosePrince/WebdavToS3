@@ -1,0 +1,36 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 9000,
+    "trustProxy": true,
+    "maxObjectSizeBytes": 5368709120,
+    "requestTimeoutMs": 300000
+  },
+  "s3": {
+    "region": "us-east-1"
+  },
+  "tenants": [
+    {
+      "id": "tenant-a",
+      "accessKeyId": "demo-access-key",
+      "secretAccessKey": "demo-secret-key",
+      "upstreams": [
+        {
+          "id": "primary",
+          "endpoint": "https://dav.example.com/remote.php/dav/files/demo",
+          "username": "demo-user",
+          "password": "demo-password",
+          "rejectUnauthorized": true
+        }
+      ],
+      "buckets": [
+        {
+          "name": "demo-bucket",
+          "upstreamId": "primary",
+          "rootPath": "/s3-root",
+          "region": "us-east-1"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+node_modules/
+dist/
+webdavtos3.config.json
+*.log
+.env
