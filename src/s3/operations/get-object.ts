@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import { WebdavClient, WebdavError } from '../../webdav/client.js';
 import { objectToWebdavPath } from '../../webdav/path-mapper.js';
 import type { BucketBinding } from '../../tenancy/tenant-registry.js';
@@ -36,10 +37,10 @@ export async function getObject(
 
     if (resp.statusCode === 304) {
       // Not Modified
-      return { statusCode: 304, headers: responseHeaders, body: resp.body };
+      return { statusCode: 304, headers: responseHeaders, body: Readable.from(resp.body) };
     }
 
-    return { statusCode, headers: responseHeaders, body: resp.body };
+    return { statusCode, headers: responseHeaders, body: Readable.from(resp.body) };
   } catch (err) {
     if (err instanceof WebdavError) {
       if (err.statusCode === 404) throw new S3OperationError('NoSuchKey', 'The specified key does not exist.', 404);

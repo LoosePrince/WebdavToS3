@@ -30,10 +30,13 @@ export function mapObjectKeyToWebdavPath(
 
   const full = rootWithSlash + normalisedKey;
   const resolved = resolve('/', full);
-  const resolvedStr = resolved.replace(/\\/g, '/');
+  let resolvedStr = resolved.replace(/\\/g, '/');
+  // Strip Windows drive letter prefix (e.g., "D:") from WebDAV paths
+  resolvedStr = resolvedStr.replace(/^[a-zA-Z]:/, '');
 
   // Verify it's still under the root
-  const rootCanonical = resolve('/', rootWithSlash).replace(/\\/g, '/') + '/';
+  let rootCanonical = resolve('/', rootWithSlash).replace(/\\/g, '/');
+  rootCanonical = rootCanonical.replace(/^[a-zA-Z]:/, '') + '/';
   if (!resolvedStr.startsWith(rootCanonical) && resolvedStr + '/' !== rootCanonical) {
     throw new PathTraversalError(`Resolved path escapes tenant root`);
   }

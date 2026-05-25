@@ -28,6 +28,11 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     });
   });
 
+  // Body parsers for S3-like content types
+  app.addContentTypeParser('text/plain', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
+  app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
+  app.addContentTypeParser('binary/octet-stream', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
+
   // Response logging
   app.addHook('onResponse', async (req: FastifyRequest, reply: FastifyReply) => {
     const requestId = (req as any).__requestId || getRequestId();

@@ -275,12 +275,14 @@ function authenticateRequest(
   registry: TenantRegistry,
 ): AuthResult {
   const authHeader = headers['authorization'];
+  console.log('SERVER authHeader:', JSON.stringify(authHeader));
   if (!authHeader) {
     return { ok: false, code: 'AccessDenied', message: 'Missing Authorization header' };
   }
 
   // Extract access key from auth header
   const match = authHeader.match(/Credential=([^/]+)/);
+  console.log('SERVER match result:', match);
   if (!match) {
     return { ok: false, code: 'AccessDenied', message: 'Malformed Authorization header' };
   }

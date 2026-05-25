@@ -37,6 +37,21 @@ export async function putObject(
       return { statusCode: 200, etag };
     }
 
+    // 404 usually means parent directory doesn't exist — retry after creating parent
+    if (resp.statusCode === 404 && parentPath) {
+      try {
+        await client.ensureCollection(parentPath);
+      } catch {
+        // ignore
+      }
+      const retryResp = await client.put(webdavPath, body, contentLength);
+      const retryEtag = retryResp.headers['etag'] ?? `"${createHash('md5').update('webs3').digest('hex')}"`;
+      if (retryResp.statusCode === 201 || retryResp.statusCode === 204 || retryResp.statusCode === 200) {
+        return { statusCode: 200, etag: retryEtag };
+      }
+      throw new S3OperationError('InternalError', `Upstream returned ${retryResp.statusCode} after retry`, 500);
+    }
+
     throw new S3OperationError('InternalError', `Unexpected upstream status: ${resp.statusCode}`, 500);
   } catch (err) {
     if (err instanceof WebdavError) {

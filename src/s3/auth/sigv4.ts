@@ -34,7 +34,21 @@ export function verifySigV4(params: SigV4Params): SigV4Result {
 
   const trimmedDate = dateHeader.trim();
   const isIso8601 = trimmedDate.includes('T');
-  const parsedTime = new Date(isIso8601 ? `${trimmedDate}Z` : trimmedDate);
+
+  let parsedTime: Date;
+  if (isIso8601) {
+    // x-amz-date format: YYYYMMDDTHHmmssZ  (cannot be parsed by new Date() directly)
+    const match = trimmedDate.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/);
+    if (match) {
+      parsedTime = new Date(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`);
+    } else {
+      // Fallback: try with appended Z
+      parsedTime = new Date(trimmedDate.endsWith('Z') ? trimmedDate : `${trimmedDate}Z`);
+    }
+  } else {
+    // HTTP Date header: Mon, 25 May 2026 08:30:00 GMT
+    parsedTime = new Date(trimmedDate);
+  }
   if (isNaN(parsedTime.getTime())) {
     return { ok: false, code: 'AccessDenied', message: 'Invalid date format' };
   }
@@ -103,16 +117,15 @@ interface ParsedAuth {
 }
 
 function parseAuthHeader(auth: string): ParsedAuth | null {
-  const parts = auth.split(', ').map((s) => s.trim());
+  const parts = auth.split(',').map((s) => s.trim());
   if (parts.length === 0) return null;
 
   const first = parts[0].split(' ');
   if (first.length < 2) return null;
   const algorithm = first[0];
-
-  const credPart = parts.find((p) => p.startsWith('Credential='));
-  if (!credPart) return null;
-  const credValue = credPart.slice('Credential='.length);
+  const credFull = first[1];
+  if (!credFull.startsWith('Credential=')) return null;
+  const credValue = credFull.slice('Credential='.length);
   const credSegments = credValue.split('/');
   if (credSegments.length < 5) return null;
   const accessKey = credSegments[0];

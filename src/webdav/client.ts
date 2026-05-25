@@ -1,9 +1,10 @@
-import { request, Dispatcher } from 'undici';
+import * as http from 'node:http';
+import * as https from 'node:https';
 
 export interface WebdavResponse {
   statusCode: number;
   headers: Record<string, string>;
-  body: NodeJS.ReadableStream;
+  body: Buffer;
 }
 
 export interface WebdavStat {
@@ -84,8 +85,12 @@ export class WebdavClient {
     resourcePath: string,
     opts?: { body?: NodeJS.ReadableStream | Buffer; headers?: Record<string, string>; contentLength?: number },
   ): Promise<WebdavResponse> {
-    const url = this.url(resourcePath);
+    const urlStr = this.url(resourcePath);
+    const parsedUrl = new URL(urlStr);
+    const isHttps = parsedUrl.protocol === 'https:';
+
     const headers: Record<string, string> = {
+      host: parsedUrl.hostname,
       ...(opts?.headers ?? {}),
     };
     if (opts?.contentLength !== undefined) {
@@ -96,27 +101,74 @@ export class WebdavClient {
     const auth = Buffer.from(`${this.opts.username}:${this.opts.password}`).toString('base64');
     headers['authorization'] = `Basic ${auth}`;
 
-    const resp = await request(url, {
-      method: method as Dispatcher.HttpMethod,
-      headers,
-      body: opts?.body as any,
-      headersTimeout: this.opts.requestTimeoutMs,
-      bodyTimeout: this.opts.requestTimeoutMs,
-    });
+    const mod = isHttps ? https : http;
 
-    return {
-      statusCode: resp.statusCode,
-      headers: Object.fromEntries(
-        Object.entries(resp.headers).map(([k, v]) => [k.toLowerCase(), String(v ?? '')]),
-      ),
-      body: resp.body,
+    const doRequest = (url: URL, redirectCount = 0): Promise<WebdavResponse> => {
+      const targetIsHttps = url.protocol === 'https:';
+      const targetMod = targetIsHttps ? https : http;
+
+      return new Promise((resolve, reject) => {
+        const authHeader = headers['authorization'] ?? `Basic ${Buffer.from(`${this.opts.username}:${this.opts.password}`).toString('base64')}`;
+        const reqHeaders: Record<string, string> = { ...headers, host: url.hostname };
+        if (opts?.contentLength !== undefined) {
+          reqHeaders['content-length'] = String(opts.contentLength);
+        }
+
+        const req = targetMod.request(
+          {
+            hostname: url.hostname,
+            port: targetIsHttps ? 443 : 80,
+            path: url.pathname + url.search,
+            method,
+            headers: reqHeaders,
+            rejectUnauthorized: this.opts.rejectUnauthorized,
+            timeout: this.opts.requestTimeoutMs,
+          },
+          (res) => {
+            const status = res.statusCode ?? 0;
+            // Follow redirects (up to 5 hops)
+            if ((status === 301 || status === 302 || status === 307 || status === 308) && redirectCount < 5) {
+              const location = res.headers['location'];
+              if (location) {
+                const redirectUrl = location.startsWith('http') ? new URL(location) : new URL(url.origin + location);
+                resolve(doRequest(redirectUrl, redirectCount + 1));
+                return;
+              }
+            }
+            const chunks: Buffer[] = [];
+            res.on('data', (c: Buffer) => chunks.push(c));
+            res.on('end', () => {
+              resolve({
+                statusCode: status,
+                headers: Object.fromEntries(
+                  Object.entries(res.headers).map(([k, v]) => [k.toLowerCase(), String(v ?? '')]),
+                ),
+                body: Buffer.concat(chunks),
+              });
+            });
+          },
+        );
+        req.on('error', reject);
+
+        if (opts?.body) {
+          if (Buffer.isBuffer(opts.body)) {
+            req.end(opts.body);
+          } else {
+            (opts.body as NodeJS.ReadableStream).pipe(req);
+          }
+        } else {
+          req.end();
+        }
+      });
     };
+
+    return doRequest(parsedUrl);
   }
 
   async ensureCollection(resourcePath: string): Promise<void> {
     const resp = await this.mkcol(resourcePath);
     if (resp.statusCode === 201 || resp.statusCode === 405) return;
-    if (resp.statusCode === 409) {
+    if (resp.statusCode === 409 || resp.statusCode === 404) {
       const parent = resourcePath.replace(/\/[^/]+$/, '');
       if (parent && parent !== resourcePath) {
         await this.ensureCollection(parent);
@@ -136,7 +188,7 @@ export class WebdavClient {
     if (resp.statusCode >= 400) {
       throw new WebdavError(`PROPFIND stat failed: ${resp.statusCode}`, resp.statusCode);
     }
-    const body = await collectBody(resp.body);
+    const body = collectBody(resp.body);
     const entries = parsePropfindResponse(body);
     const entry = entries[0];
     if (!entry) {
@@ -207,11 +259,6 @@ function extractTag(xml: string, tagName: string): string {
   return m ? m[1].trim() : '';
 }
 
-function collectBody(stream: NodeJS.ReadableStream): Promise<string> {
-  const chunks: Buffer[] = [];
-  return new Promise((resolve, reject) => {
-    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
-    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    stream.on('error', reject);
-  });
+function collectBody(body: Buffer): string {
+  return body.toString('utf-8');
 }
