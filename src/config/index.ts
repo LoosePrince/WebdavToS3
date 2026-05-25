@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { AppConfigSchema, type AppConfig } from './schema.js';
 
@@ -12,6 +12,7 @@ function resolveConfigPath(): string {
 }
 
 let _cachedConfig: AppConfig | null = null;
+let _configPath: string | null = null;
 
 export function loadConfig(forceReload = false): AppConfig {
   if (_cachedConfig && !forceReload) return _cachedConfig;
@@ -28,12 +29,29 @@ export function loadConfig(forceReload = false): AppConfig {
   const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
   const parsed = AppConfigSchema.parse(raw);
   _cachedConfig = parsed;
+  _configPath = configPath;
   return parsed;
 }
 
 export function getConfig(): AppConfig {
   if (!_cachedConfig) return loadConfig();
   return _cachedConfig;
+}
+
+export function getConfigPath(): string {
+  if (!_configPath) loadConfig();
+  return _configPath!;
+}
+
+/**
+ * Validate, save to disk, and update the in-memory cache.
+ */
+export function saveConfig(raw: unknown): AppConfig {
+  const parsed = AppConfigSchema.parse(raw);
+  const path = getConfigPath();
+  writeFileSync(path, JSON.stringify(parsed, null, 2), 'utf-8');
+  _cachedConfig = parsed;
+  return parsed;
 }
 
 export { type AppConfig } from './schema.js';

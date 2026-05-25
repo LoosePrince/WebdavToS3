@@ -1,5 +1,6 @@
 import { buildApp } from './http/app.js';
 import { loadConfig } from './config/index.js';
+import { generateAdminKey } from './admin/key.js';
 import {
   TenantRegistry,
   type Tenant,
@@ -54,9 +55,10 @@ function buildTenantRegistry(): TenantRegistry {
 async function main() {
   try {
     const config = loadConfig();
-    const registry = buildTenantRegistry();
+    const tenantRegistry = buildTenantRegistry();
+    const adminKey = generateAdminKey();
 
-    const app = buildApp(registry);
+    const app = buildApp({ tenantRegistry, adminKey });
 
     await app.listen({
       host: config.server.host,
@@ -66,7 +68,8 @@ async function main() {
     info('server started', {
       host: config.server.host,
       port: config.server.port,
-      tenants: registry.allTenants.length,
+      tenants: tenantRegistry.allTenants.length,
+      adminUrl: `http://${config.server.host === '0.0.0.0' ? '127.0.0.1' : config.server.host}:${config.server.port}/admin/${adminKey}`,
     });
   } catch (err) {
     error('failed to start server', { error: String(err) });
