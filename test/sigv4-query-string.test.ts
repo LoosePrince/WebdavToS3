@@ -123,6 +123,37 @@ function signRequest(method: string, pathname: string, queryString: string, host
   };
 }
 
+function createPresignedQuery(method: string, pathname: string, host: string, extraQuery = 'x-id=GetObject'): string {
+  const amzDate = new Date().toISOString().replace(/[:-]/g, '').split('.')[0] + 'Z';
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/${REGION}/s3/aws4_request`;
+  const baseQuery = [
+    'X-Amz-Algorithm=AWS4-HMAC-SHA256',
+    `X-Amz-Content-Sha256=${encodeURIComponent('UNSIGNED-PAYLOAD')}`,
+    `X-Amz-Credential=${encodeURIComponent(`${ACCESS_KEY}/${credentialScope}`)}`,
+    `X-Amz-Date=${amzDate}`,
+    'X-Amz-Expires=300',
+    'X-Amz-SignedHeaders=host',
+    extraQuery,
+  ].join('&');
+  const canonicalRequest = [
+    method.toUpperCase(),
+    pathname,
+    buildCanonicalQueryString(baseQuery),
+    `host:${host}\n`,
+    'host',
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    createHash('sha256').update(canonicalRequest).digest('hex'),
+  ].join('\n');
+  const signature = createHmac('sha256', deriveSigningKey(SECRET_KEY, dateStamp, REGION)).update(stringToSign).digest('hex');
+  return `${baseQuery}&X-Amz-Signature=${signature}`;
+}
+
 function deriveSigningKey(secret: string, dateStamp: string, region: string): Buffer {
   const kDate = createHmac('sha256', `AWS4${secret}`).update(dateStamp).digest();
   const kRegion = createHmac('sha256', kDate).update(region).digest();
@@ -164,5 +195,22 @@ describe('SigV4 query string auth', () => {
     });
 
     expect(response.statusCode).toBe(200);
+  });
+
+  it('accepts presigned URL authentication without Authorization header', async () => {
+    const app = createApp();
+    apps.push(app);
+
+    const queryString = createPresignedQuery('HEAD', '/uniid', '127.0.0.1', 'x-id=HeadBucket');
+    const response = await app.inject({
+      method: 'HEAD',
+      url: `/uniid?${queryString}`,
+      headers: {
+        host: '127.0.0.1',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['x-amz-bucket-region']).toBe(REGION);
   });
 });

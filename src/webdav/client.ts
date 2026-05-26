@@ -117,7 +117,7 @@ export class WebdavClient {
         const req = targetMod.request(
           {
             hostname: url.hostname,
-            port: targetIsHttps ? 443 : 80,
+            port: url.port ? Number(url.port) : targetIsHttps ? 443 : 80,
             path: url.pathname + url.search,
             method,
             headers: reqHeaders,

@@ -2,15 +2,13 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 const SigV4Algorithm = 'AWS4-HMAC-SHA256';
 const ServiceName = 's3';
-const ClockSkewMs = 15 * 60 * 1000; // 15 minutes
+const ClockSkewMs = 15 * 60 * 1000;
 
-/**
- * Minimal SigV4 header signature verification.
- *
- * Header-based signatures only. No presigned URL, streaming/chunked, or security-token support yet.
- */
 export function verifySigV4(params: SigV4Params): SigV4Result {
-  const { method, pathname, queryString = '', headers, secretAccessKey } = params;
+  const { queryString = '', headers } = params;
+  if (isPresignedRequest(queryString)) {
+    return verifyPresignedSigV4(params);
+  }
 
   const authHeader = headers['authorization'];
   if (!authHeader) {
@@ -26,86 +24,132 @@ export function verifySigV4(params: SigV4Params): SigV4Result {
     return { ok: false, code: 'SignatureDoesNotMatch', message: 'Unsupported algorithm' };
   }
 
-  // Validate time with clock skew allowance
   const dateHeader = (headers['x-amz-date'] || headers['date'] || '') as string;
   if (!dateHeader) {
     return { ok: false, code: 'AccessDenied', message: 'Missing x-amz-date or Date header' };
   }
 
-  const trimmedDate = dateHeader.trim();
-  const isIso8601 = trimmedDate.includes('T');
+  const timeResult = validateRequestTime(dateHeader, ClockSkewMs);
+  if (!timeResult.ok) return timeResult;
 
-  let parsedTime: Date;
-  if (isIso8601) {
-    // x-amz-date format: YYYYMMDDTHHmmssZ  (cannot be parsed by new Date() directly)
-    const match = trimmedDate.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/);
-    if (match) {
-      parsedTime = new Date(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`);
-    } else {
-      // Fallback: try with appended Z
-      parsedTime = new Date(trimmedDate.endsWith('Z') ? trimmedDate : `${trimmedDate}Z`);
-    }
-  } else {
-    // HTTP Date header: Mon, 25 May 2026 08:30:00 GMT
-    parsedTime = new Date(trimmedDate);
-  }
-  if (isNaN(parsedTime.getTime())) {
+  const dateStamp = parsed.dateStr || dateHeader.slice(0, 8);
+  const amzDate = normalizeAmzDate(dateHeader);
+  if (!amzDate) {
     return { ok: false, code: 'AccessDenied', message: 'Invalid date format' };
   }
-  const now = Date.now();
-  if (Math.abs(parsedTime.getTime() - now) > ClockSkewMs) {
-    return { ok: false, code: 'RequestTimeTooSkewed', message: 'The difference between the request time and the current time is too large' };
-  }
 
-  // Build date stamp from x-amz-date
-  const dateStamp = parsedTime.toISOString().slice(0, 10).replace(/-/g, '');
-  const timeStr = parsedTime.toISOString().slice(11, 19).replace(/:/g, '');
-
-  const region = parsed.region;
-  const signedHeaders = parsed.signedHeaders;
-
-  // Canonical request
-  const canonicalHeaders = buildCanonicalHeaders(headers, signedHeaders);
-  const signedHeadersStr = signedHeaders.join(';');
   const payloadHash =
     (headers['x-amz-content-sha256'] as string) ||
     'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 
-  const canonicalRequest = [
-    method.toUpperCase(),
-    pathname,
-    buildCanonicalQueryString(queryString),
-    canonicalHeaders,
-    signedHeadersStr,
+  const canonicalRequest = buildCanonicalRequest({
+    method: params.method,
+    pathname: params.pathname,
+    queryString,
+    headers,
+    signedHeaders: parsed.signedHeaders,
     payloadHash,
-  ].join('\n');
+  });
 
-  const hashedCanonical = hashHex(canonicalRequest);
-
-  // String to sign
-  const credentialScope = `${dateStamp}/${region}/${ServiceName}/aws4_request`;
-  const stringToSign = [
-    SigV4Algorithm,
-    `${dateStamp}T${timeStr}Z`,
+  const credentialScope = `${dateStamp}/${parsed.region}/${ServiceName}/aws4_request`;
+  const expectedSignature = signCanonicalRequest({
+    secretAccessKey: params.secretAccessKey,
+    dateStamp,
+    region: parsed.region,
+    amzDate,
     credentialScope,
-    hashedCanonical,
-  ].join('\n');
+    canonicalRequest,
+  });
 
-  // Compute expected signature
-  const signingKey = deriveSigningKey(secretAccessKey, dateStamp, region);
-  const expectedSignature = hmacHex(signingKey, stringToSign);
-
-  // Constant-time compare
-  const sigBuf = Buffer.from(parsed.signature, 'hex');
-  const expectedBuf = Buffer.from(expectedSignature, 'hex');
-  if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
+  if (!safeSignatureEquals(parsed.signature, expectedSignature)) {
     return { ok: false, code: 'SignatureDoesNotMatch', message: 'The request signature we calculated does not match' };
   }
 
-  return { ok: true, code: 'OK', message: '' };
+  return { ok: true, code: 'OK', message: '', accessKey: parsed.accessKey, region: parsed.region };
 }
 
-// --- Parsing ---
+function verifyPresignedSigV4(params: SigV4Params): SigV4Result {
+  const search = new URLSearchParams(params.queryString ?? '');
+  const algorithm = search.get('X-Amz-Algorithm');
+  const credential = search.get('X-Amz-Credential');
+  const amzDate = search.get('X-Amz-Date');
+  const expires = search.get('X-Amz-Expires');
+  const signedHeadersValue = search.get('X-Amz-SignedHeaders');
+  const signature = search.get('X-Amz-Signature');
+
+  if (!algorithm || !credential || !amzDate || !expires || !signedHeadersValue || !signature) {
+    return { ok: false, code: 'AccessDenied', message: 'Missing presigned URL query parameters' };
+  }
+  if (algorithm !== SigV4Algorithm) {
+    return { ok: false, code: 'SignatureDoesNotMatch', message: 'Unsupported algorithm' };
+  }
+
+  const cred = parseCredentialValue(credential);
+  if (!cred) {
+    return { ok: false, code: 'AccessDenied', message: 'Malformed X-Amz-Credential' };
+  }
+
+  const expiresSeconds = Number(expires);
+  if (!Number.isFinite(expiresSeconds) || expiresSeconds < 0) {
+    return { ok: false, code: 'AccessDenied', message: 'Invalid X-Amz-Expires' };
+  }
+
+  const timeResult = validateRequestTime(amzDate, Math.max(ClockSkewMs, expiresSeconds * 1000 + ClockSkewMs));
+  if (!timeResult.ok) return timeResult;
+
+  const signedAt = parseAmzDate(amzDate);
+  if (!signedAt) {
+    return { ok: false, code: 'AccessDenied', message: 'Invalid X-Amz-Date' };
+  }
+  if (Date.now() > signedAt.getTime() + expiresSeconds * 1000) {
+    return { ok: false, code: 'AccessDenied', message: 'Request has expired' };
+  }
+
+  const signedHeaders = signedHeadersValue.split(';').filter(Boolean);
+  const payloadHash = search.get('X-Amz-Content-Sha256') || 'UNSIGNED-PAYLOAD';
+  const canonicalRequest = buildCanonicalRequest({
+    method: params.method,
+    pathname: params.pathname,
+    queryString: params.queryString ?? '',
+    headers: params.headers,
+    signedHeaders,
+    payloadHash,
+    excludedQueryKeys: new Set(['X-Amz-Signature']),
+  });
+
+  const credentialScope = `${cred.dateStr}/${cred.region}/${ServiceName}/aws4_request`;
+  const expectedSignature = signCanonicalRequest({
+    secretAccessKey: params.secretAccessKey,
+    dateStamp: cred.dateStr,
+    region: cred.region,
+    amzDate,
+    credentialScope,
+    canonicalRequest,
+  });
+
+  if (!safeSignatureEquals(signature, expectedSignature)) {
+    return { ok: false, code: 'SignatureDoesNotMatch', message: 'The request signature we calculated does not match' };
+  }
+
+  return { ok: true, code: 'OK', message: '', accessKey: cred.accessKey, region: cred.region };
+}
+
+export function extractSigV4AccessKey(headers: Record<string, string | undefined>, queryString = ''): string | undefined {
+  const presignedCredential = new URLSearchParams(queryString).get('X-Amz-Credential');
+  if (presignedCredential) {
+    return parseCredentialValue(presignedCredential)?.accessKey;
+  }
+
+  const authHeader = headers['authorization'];
+  if (!authHeader) return undefined;
+  return parseAuthHeader(authHeader)?.accessKey;
+}
+
+function isPresignedRequest(queryString: string): boolean {
+  if (!queryString) return false;
+  const search = new URLSearchParams(queryString);
+  return search.has('X-Amz-Algorithm') || search.has('X-Amz-Signature');
+}
 
 interface ParsedAuth {
   algorithm: string;
@@ -125,26 +169,89 @@ function parseAuthHeader(auth: string): ParsedAuth | null {
   const algorithm = first[0];
   const credFull = first[1];
   if (!credFull.startsWith('Credential=')) return null;
-  const credValue = credFull.slice('Credential='.length);
-  const credSegments = credValue.split('/');
-  if (credSegments.length < 5) return null;
-  const accessKey = credSegments[0];
-  const dateStr = credSegments[1];
-  const region = credSegments[2];
-  if (credSegments[3] !== ServiceName) return null;
+
+  const credential = parseCredentialValue(credFull.slice('Credential='.length));
+  if (!credential) return null;
 
   const shPart = parts.find((p) => p.startsWith('SignedHeaders='));
   if (!shPart) return null;
-  const signedHeaders = shPart.slice('SignedHeaders='.length).split(';');
+  const signedHeaders = shPart.slice('SignedHeaders='.length).split(';').filter(Boolean);
 
   const sigPart = parts.find((p) => p.startsWith('Signature='));
   if (!sigPart) return null;
   const signature = sigPart.slice('Signature='.length);
 
-  return { algorithm, accessKey, dateStr, region, signedHeaders, signature };
+  return { algorithm, ...credential, signedHeaders, signature };
 }
 
-// --- Helpers ---
+function parseCredentialValue(value: string): Pick<ParsedAuth, 'accessKey' | 'dateStr' | 'region'> | null {
+  const segments = value.split('/');
+  if (segments.length < 5) return null;
+  if (segments[3] !== ServiceName || segments[4] !== 'aws4_request') return null;
+  return { accessKey: segments[0], dateStr: segments[1], region: segments[2] };
+}
+
+function buildCanonicalRequest(params: {
+  method: string;
+  pathname: string;
+  queryString: string;
+  headers: Record<string, string | undefined>;
+  signedHeaders: string[];
+  payloadHash: string;
+  excludedQueryKeys?: Set<string>;
+}): string {
+  return [
+    params.method.toUpperCase(),
+    normalizeCanonicalPath(params.pathname),
+    buildCanonicalQueryString(params.queryString, params.excludedQueryKeys),
+    buildCanonicalHeaders(params.headers, params.signedHeaders),
+    params.signedHeaders.map((h) => h.toLowerCase()).sort().join(';'),
+    params.payloadHash,
+  ].join('\n');
+}
+
+function signCanonicalRequest(params: {
+  secretAccessKey: string;
+  dateStamp: string;
+  region: string;
+  amzDate: string;
+  credentialScope: string;
+  canonicalRequest: string;
+}): string {
+  const stringToSign = [
+    SigV4Algorithm,
+    params.amzDate,
+    params.credentialScope,
+    hashHex(params.canonicalRequest),
+  ].join('\n');
+  const signingKey = deriveSigningKey(params.secretAccessKey, params.dateStamp, params.region);
+  return hmacHex(signingKey, stringToSign);
+}
+
+function validateRequestTime(dateValue: string, allowedSkewMs: number): SigV4Result {
+  const parsed = parseAmzDate(dateValue) ?? new Date(dateValue.trim());
+  if (isNaN(parsed.getTime())) {
+    return { ok: false, code: 'AccessDenied', message: 'Invalid date format' };
+  }
+  if (Math.abs(parsed.getTime() - Date.now()) > allowedSkewMs) {
+    return { ok: false, code: 'RequestTimeTooSkewed', message: 'The difference between the request time and the current time is too large' };
+  }
+  return { ok: true, code: 'OK', message: '' };
+}
+
+function parseAmzDate(value: string): Date | null {
+  const match = value.trim().match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (!match) return null;
+  return new Date(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`);
+}
+
+function normalizeAmzDate(value: string): string | null {
+  const trimmed = value.trim();
+  if (/^\d{8}T\d{6}Z$/.test(trimmed)) return trimmed;
+  const parsed = new Date(trimmed);
+  if (isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().replace(/[:-]/g, '').split('.')[0] + 'Z';
+}
 
 function hashHex(data: string): string {
   return createHash('sha256').update(data, 'utf-8').digest('hex');
@@ -158,42 +265,40 @@ function deriveSigningKey(secret: string, dateStamp: string, region: string): Bu
   const kDate = createHmac('sha256', `AWS4${secret}`).update(dateStamp, 'utf-8').digest();
   const kRegion = createHmac('sha256', kDate).update(region, 'utf-8').digest();
   const kService = createHmac('sha256', kRegion).update(ServiceName, 'utf-8').digest();
-  const kSigning = createHmac('sha256', kService).update('aws4_request', 'utf-8').digest();
-  return kSigning;
+  return createHmac('sha256', kService).update('aws4_request', 'utf-8').digest();
 }
 
-function buildCanonicalHeaders(
-  headers: Record<string, string | undefined>,
-  signedHeaders: string[],
-): string {
-  return signedHeaders
-    .map((h) => {
-      const lower = h.toLowerCase();
-      const val = (headers[lower] || headers[h] || '').trim();
-      return `${lower}:${val}\n`;
-    })
+function buildCanonicalHeaders(headers: Record<string, string | undefined>, signedHeaders: string[]): string {
+  return [...signedHeaders]
+    .map((h) => h.toLowerCase())
+    .sort()
+    .map((lower) => `${lower}:${normalizeHeaderValue(headers[lower] || headers[lower.toUpperCase()] || '')}\n`)
     .join('');
 }
 
-function buildCanonicalQueryString(queryString: string): string {
+function normalizeHeaderValue(value: string): string {
+  return value.trim().replace(/\s+/g, ' ');
+}
+
+function buildCanonicalQueryString(queryString: string, excludedKeys = new Set<string>()): string {
   if (!queryString) return '';
 
-  return queryString
-    .split('&')
-    .filter((segment) => segment.length > 0)
-    .map((segment) => {
-      const eqIndex = segment.indexOf('=');
-      const rawKey = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
-      const rawValue = eqIndex === -1 ? '' : segment.slice(eqIndex + 1);
-      return {
-        key: encodeRfc3986(decodeQueryComponent(rawKey)),
-        value: encodeRfc3986(decodeQueryComponent(rawValue)),
-      };
-    })
-    .sort((a, b) => {
-      if (a.key === b.key) return a.value.localeCompare(b.value);
-      return a.key.localeCompare(b.key);
-    })
+  const pairs: Array<{ key: string; value: string }> = [];
+  for (const segment of queryString.split('&')) {
+    if (!segment) continue;
+    const eqIndex = segment.indexOf('=');
+    const rawKey = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
+    const rawValue = eqIndex === -1 ? '' : segment.slice(eqIndex + 1);
+    const decodedKey = decodeQueryComponent(rawKey);
+    if (excludedKeys.has(decodedKey)) continue;
+    pairs.push({
+      key: encodeRfc3986(decodedKey),
+      value: encodeRfc3986(decodeQueryComponent(rawValue)),
+    });
+  }
+
+  return pairs
+    .sort((a, b) => (a.key === b.key ? a.value.localeCompare(b.value) : a.key.localeCompare(b.key)))
     .map(({ key, value }) => `${key}=${value}`)
     .join('&');
 }
@@ -210,7 +315,15 @@ function encodeRfc3986(value: string): string {
   return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
-// --- Types ---
+function normalizeCanonicalPath(pathname: string): string {
+  return pathname || '/';
+}
+
+function safeSignatureEquals(actual: string, expected: string): boolean {
+  const actualBuf = Buffer.from(actual, 'hex');
+  const expectedBuf = Buffer.from(expected, 'hex');
+  return actualBuf.length === expectedBuf.length && timingSafeEqual(actualBuf, expectedBuf);
+}
 
 export interface SigV4Params {
   method: string;
@@ -219,12 +332,12 @@ export interface SigV4Params {
   headers: Record<string, string | undefined>;
   body: Buffer | null;
   secretAccessKey: string;
-  /** Access key found during parse (for tenant lookup) */
-  accessKey?: string;
 }
 
 export interface SigV4Result {
   ok: boolean;
   code: string;
   message: string;
+  accessKey?: string;
+  region?: string;
 }
