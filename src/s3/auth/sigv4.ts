@@ -10,7 +10,7 @@ const ClockSkewMs = 15 * 60 * 1000; // 15 minutes
  * Header-based signatures only. No presigned URL, streaming/chunked, or security-token support yet.
  */
 export function verifySigV4(params: SigV4Params): SigV4Result {
-  const { method, pathname, headers, secretAccessKey } = params;
+  const { method, pathname, queryString = '', headers, secretAccessKey } = params;
 
   const authHeader = headers['authorization'];
   if (!authHeader) {
@@ -74,7 +74,7 @@ export function verifySigV4(params: SigV4Params): SigV4Result {
   const canonicalRequest = [
     method.toUpperCase(),
     pathname,
-    '',
+    buildCanonicalQueryString(queryString),
     canonicalHeaders,
     signedHeadersStr,
     payloadHash,
@@ -175,11 +175,47 @@ function buildCanonicalHeaders(
     .join('');
 }
 
+function buildCanonicalQueryString(queryString: string): string {
+  if (!queryString) return '';
+
+  return queryString
+    .split('&')
+    .filter((segment) => segment.length > 0)
+    .map((segment) => {
+      const eqIndex = segment.indexOf('=');
+      const rawKey = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
+      const rawValue = eqIndex === -1 ? '' : segment.slice(eqIndex + 1);
+      return {
+        key: encodeRfc3986(decodeQueryComponent(rawKey)),
+        value: encodeRfc3986(decodeQueryComponent(rawValue)),
+      };
+    })
+    .sort((a, b) => {
+      if (a.key === b.key) return a.value.localeCompare(b.value);
+      return a.key.localeCompare(b.key);
+    })
+    .map(({ key, value }) => `${key}=${value}`)
+    .join('&');
+}
+
+function decodeQueryComponent(value: string): string {
+  try {
+    return decodeURIComponent(value.replace(/\+/g, '%20'));
+  } catch {
+    return value;
+  }
+}
+
+function encodeRfc3986(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
 // --- Types ---
 
 export interface SigV4Params {
   method: string;
   pathname: string;
+  queryString?: string;
   headers: Record<string, string | undefined>;
   body: Buffer | null;
   secretAccessKey: string;

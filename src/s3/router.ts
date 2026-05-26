@@ -30,6 +30,7 @@ export async function handleS3Request(
   tenantRegistry: TenantRegistry,
 ): Promise<void> {
   const pathname = req.url.split('?')[0];
+  const rawQueryString = req.url.includes('?') ? req.url.slice(req.url.indexOf('?') + 1) : '';
   const query = req.query as Record<string, string | undefined>;
   const method = req.method.toUpperCase();
   const headers = req.headers as Record<string, string>;
@@ -38,7 +39,7 @@ export async function handleS3Request(
   // Special routes
   if (pathname === '/' && method === 'GET') {
     // ListAllMyBuckets
-    const authResult = authenticateRequest(headers, method, '/', tenantRegistry);
+    const authResult = authenticateRequest(headers, method, '/', '', tenantRegistry);
     if (!authResult.ok) {
       return sendS3Error(reply, authResult.code!, authResult.message!, 403, requestId);
     }
@@ -81,7 +82,7 @@ export async function handleS3Request(
   }
 
   // Auth
-  const authResult = authenticateRequest(headers, method, pathname, tenantRegistry);
+  const authResult = authenticateRequest(headers, method, pathname, rawQueryString, tenantRegistry);
   if (!authResult.ok) {
     return sendS3Error(reply, authResult.code!, authResult.message!, 403, requestId);
   }
@@ -272,17 +273,16 @@ function authenticateRequest(
   headers: Record<string, string>,
   method: string,
   pathname: string,
+  queryString: string,
   registry: TenantRegistry,
 ): AuthResult {
   const authHeader = headers['authorization'];
-  console.log('SERVER authHeader:', JSON.stringify(authHeader));
   if (!authHeader) {
     return { ok: false, code: 'AccessDenied', message: 'Missing Authorization header' };
   }
 
   // Extract access key from auth header
   const match = authHeader.match(/Credential=([^/]+)/);
-  console.log('SERVER match result:', match);
   if (!match) {
     return { ok: false, code: 'AccessDenied', message: 'Malformed Authorization header' };
   }
@@ -296,6 +296,7 @@ function authenticateRequest(
   const result = verifySigV4({
     method,
     pathname,
+    queryString,
     headers,
     body: null,
     secretAccessKey: tenant.secretAccessKey,

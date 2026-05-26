@@ -32,6 +32,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
   app.addContentTypeParser('text/plain', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
   app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
   app.addContentTypeParser('binary/octet-stream', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
+  app.addContentTypeParser('*', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
 
   // Response logging
   app.addHook('onResponse', async (req: FastifyRequest, reply: FastifyReply) => {
