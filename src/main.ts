@@ -41,6 +41,7 @@ function buildTenantRegistry(): TenantRegistry {
       id: tc.id,
       accessKeyId: tc.accessKeyId,
       secretAccessKey: tc.secretAccessKey,
+      sessionToken: tc.sessionToken,
       upstreams,
       buckets,
     };

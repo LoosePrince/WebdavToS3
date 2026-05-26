@@ -24,6 +24,9 @@ export function verifySigV4(params: SigV4Params): SigV4Result {
     return { ok: false, code: 'SignatureDoesNotMatch', message: 'Unsupported algorithm' };
   }
 
+  const tokenResult = validateSessionToken(params.sessionToken, headers['x-amz-security-token']);
+  if (!tokenResult.ok) return tokenResult;
+
   const dateHeader = (headers['x-amz-date'] || headers['date'] || '') as string;
   if (!dateHeader) {
     return { ok: false, code: 'AccessDenied', message: 'Missing x-amz-date or Date header' };
@@ -89,6 +92,9 @@ function verifyPresignedSigV4(params: SigV4Params): SigV4Result {
     return { ok: false, code: 'AccessDenied', message: 'Malformed X-Amz-Credential' };
   }
 
+  const tokenResult = validateSessionToken(params.sessionToken, search.get('X-Amz-Security-Token') ?? undefined);
+  if (!tokenResult.ok) return tokenResult;
+
   const expiresSeconds = Number(expires);
   if (!Number.isFinite(expiresSeconds) || expiresSeconds < 0) {
     return { ok: false, code: 'AccessDenied', message: 'Invalid X-Amz-Expires' };
@@ -143,6 +149,48 @@ export function extractSigV4AccessKey(headers: Record<string, string | undefined
   const authHeader = headers['authorization'];
   if (!authHeader) return undefined;
   return parseAuthHeader(authHeader)?.accessKey;
+}
+
+export function extractPostPolicyAccessKey(fields: Record<string, string | undefined>): string | undefined {
+  const credential = fields['x-amz-credential'] ?? fields['X-Amz-Credential'];
+  return credential ? parseCredentialValue(credential)?.accessKey : undefined;
+}
+
+export function verifyPostPolicySigV4(params: PostPolicySigV4Params): SigV4Result {
+  const fields = normalizeFieldNames(params.fields);
+  const algorithm = fields['x-amz-algorithm'];
+  const credential = fields['x-amz-credential'];
+  const amzDate = fields['x-amz-date'];
+  const policy = fields.policy;
+  const signature = fields['x-amz-signature'];
+
+  if (!algorithm || !credential || !amzDate || !policy || !signature) {
+    return { ok: false, code: 'AccessDenied', message: 'Missing POST policy fields' };
+  }
+  if (algorithm !== SigV4Algorithm) {
+    return { ok: false, code: 'SignatureDoesNotMatch', message: 'Unsupported algorithm' };
+  }
+
+  const cred = parseCredentialValue(credential);
+  if (!cred) {
+    return { ok: false, code: 'AccessDenied', message: 'Malformed x-amz-credential' };
+  }
+
+  const tokenResult = validateSessionToken(params.sessionToken, fields['x-amz-security-token']);
+  if (!tokenResult.ok) return tokenResult;
+
+  const timeResult = validateRequestTime(amzDate, ClockSkewMs);
+  if (!timeResult.ok) return timeResult;
+
+  const policyResult = validatePostPolicy(policy, params.now ?? new Date());
+  if (!policyResult.ok) return policyResult;
+
+  const expectedSignature = hmacHex(deriveSigningKey(params.secretAccessKey, cred.dateStr, cred.region), policy);
+  if (!safeSignatureEquals(signature, expectedSignature)) {
+    return { ok: false, code: 'SignatureDoesNotMatch', message: 'The POST policy signature does not match' };
+  }
+
+  return { ok: true, code: 'OK', message: '', accessKey: cred.accessKey, region: cred.region };
 }
 
 function isPresignedRequest(queryString: string): boolean {
@@ -239,6 +287,37 @@ function validateRequestTime(dateValue: string, allowedSkewMs: number): SigV4Res
   return { ok: true, code: 'OK', message: '' };
 }
 
+function validateSessionToken(expected: string | undefined, actual: string | undefined): SigV4Result {
+  if (!expected) return { ok: true, code: 'OK', message: '' };
+  if (!actual) return { ok: false, code: 'AccessDenied', message: 'Missing security token' };
+  if (actual !== expected) return { ok: false, code: 'InvalidToken', message: 'The provided token is malformed or otherwise invalid' };
+  return { ok: true, code: 'OK', message: '' };
+}
+
+function validatePostPolicy(policy: string, now: Date): SigV4Result {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(policy, 'base64').toString('utf-8'));
+  } catch {
+    return { ok: false, code: 'AccessDenied', message: 'Malformed POST policy' };
+  }
+  if (!parsed || typeof parsed !== 'object' || !('expiration' in parsed)) {
+    return { ok: false, code: 'AccessDenied', message: 'POST policy is missing expiration' };
+  }
+  const expiration = new Date(String((parsed as { expiration: unknown }).expiration));
+  if (isNaN(expiration.getTime())) {
+    return { ok: false, code: 'AccessDenied', message: 'POST policy has invalid expiration' };
+  }
+  if (now.getTime() > expiration.getTime()) {
+    return { ok: false, code: 'AccessDenied', message: 'POST policy has expired' };
+  }
+  return { ok: true, code: 'OK', message: '' };
+}
+
+function normalizeFieldNames(fields: Record<string, string | undefined>): Record<string, string | undefined> {
+  return Object.fromEntries(Object.entries(fields).map(([key, value]) => [key.toLowerCase(), value]));
+}
+
 function parseAmzDate(value: string): Date | null {
   const match = value.trim().match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
   if (!match) return null;
@@ -332,6 +411,14 @@ export interface SigV4Params {
   headers: Record<string, string | undefined>;
   body: Buffer | null;
   secretAccessKey: string;
+  sessionToken?: string;
+}
+
+export interface PostPolicySigV4Params {
+  fields: Record<string, string | undefined>;
+  secretAccessKey: string;
+  sessionToken?: string;
+  now?: Date;
 }
 
 export interface SigV4Result {

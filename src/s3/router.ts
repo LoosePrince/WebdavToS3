@@ -1,5 +1,10 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
-import { verifySigV4, extractSigV4AccessKey } from './auth/sigv4.js';
+import {
+  verifySigV4,
+  extractSigV4AccessKey,
+  verifyPostPolicySigV4,
+  extractPostPolicyAccessKey,
+} from './auth/sigv4.js';
 import { TenantRegistry, type BucketBinding, type Tenant } from '../tenancy/tenant-registry.js';
 import { WebdavClient } from '../webdav/client.js';
 import { parsePathStyleUrl } from '../utils/path-mapper.js';
@@ -71,6 +76,15 @@ export async function handleS3Request(
 
   if (!ctx.bucketName || !ctx.bucket) {
     return sendS3Error(reply, 'NoSuchBucket', 'The specified bucket does not exist', 404, ctx.requestId);
+  }
+
+  if (ctx.method === 'POST' && isPostPolicyUpload(ctx)) {
+    const auth = authenticatePostPolicyRequest(ctx, tenantRegistry);
+    if (!auth.ok) return sendS3Error(reply, auth.code!, auth.message!, 403, ctx.requestId);
+    if (auth.accessKey !== ctx.ownerTenant?.accessKeyId) {
+      return sendS3Error(reply, 'AccessDenied', 'Access denied', 403, ctx.requestId);
+    }
+    return handlePostPolicyUpload(ctx);
   }
 
   const auth = authenticateRequest(ctx.headers, ctx.method, ctx.pathname, ctx.rawQueryString, tenantRegistry);
@@ -294,9 +308,24 @@ async function handleHeadObject(ctx: S3RequestContext) {
 }
 
 async function handlePutObject(ctx: S3RequestContext) {
-  const contentLength = ctx.headers['content-length'] ? parseInt(ctx.headers['content-length'], 10) : undefined;
-  const result = await putObject(ctx.client!, ctx.bucket!, ctx.key, ctx.req.body as NodeJS.ReadableStream | Buffer, contentLength);
+  const body = decodeStreamingPayloadIfNeeded(ctx.headers, ctx.req.body);
+  const contentLength = body.length || (ctx.headers['content-length'] ? parseInt(ctx.headers['content-length'], 10) : undefined);
+  const result = await putObject(ctx.client!, ctx.bucket!, ctx.key, body, contentLength);
   return ctx.reply.status(200).header('etag', result.etag).header('x-amz-request-id', ctx.requestId).send();
+}
+
+async function handlePostPolicyUpload(ctx: S3RequestContext) {
+  const form = parsePostPolicyForm(ctx.req.body);
+  const key = form.fields.key;
+  if (!key) return sendS3Error(ctx.reply, 'InvalidArgument', 'POST policy upload requires key field', 400, ctx.requestId);
+  if (!form.file) return sendS3Error(ctx.reply, 'InvalidArgument', 'POST policy upload requires file field', 400, ctx.requestId);
+
+  const result = await putObject(ctx.client!, ctx.bucket!, key, form.file.body, form.file.body.length);
+  const status = form.fields.success_action_status ? Number(form.fields.success_action_status) : 204;
+  if (status === 201) {
+    return sendXml(ctx, 201, postPolicyUploadXml(ctx.bucketName!, key, result.etag));
+  }
+  return ctx.reply.status(Number.isFinite(status) ? status : 204).header('etag', result.etag).header('x-amz-request-id', ctx.requestId).send();
 }
 
 async function handleDeleteObject(ctx: S3RequestContext) {
@@ -478,7 +507,34 @@ function authenticateRequest(
     return { ok: false, code: 'InvalidAccessKeyId', message: 'The AWS Access Key Id you provided does not exist in our records.' };
   }
 
-  const result = verifySigV4({ method, pathname, queryString, headers, body: null, secretAccessKey: tenant.secretAccessKey });
+  const result = verifySigV4({
+    method,
+    pathname,
+    queryString,
+    headers,
+    body: null,
+    secretAccessKey: tenant.secretAccessKey,
+    sessionToken: tenant.sessionToken,
+  });
+  if (!result.ok) return { ok: false, code: result.code, message: result.message };
+  return { ok: true, accessKey };
+}
+
+function authenticatePostPolicyRequest(ctx: S3RequestContext, registry: TenantRegistry): AuthResult {
+  const fields = parsePostPolicyFields(ctx.req.body);
+  const accessKey = extractPostPolicyAccessKey(fields);
+  if (!accessKey) return { ok: false, code: 'AccessDenied', message: 'Missing POST policy credential' };
+
+  const tenant = registry.findByAccessKey(accessKey);
+  if (!tenant) {
+    return { ok: false, code: 'InvalidAccessKeyId', message: 'The AWS Access Key Id you provided does not exist in our records.' };
+  }
+
+  const result = verifyPostPolicySigV4({
+    fields,
+    secretAccessKey: tenant.secretAccessKey,
+    sessionToken: tenant.sessionToken,
+  });
   if (!result.ok) return { ok: false, code: result.code, message: result.message };
   return { ok: true, accessKey };
 }
@@ -533,6 +589,70 @@ function collectUserMetadata(headers: Record<string, string>): Record<string, st
   return Object.fromEntries(Object.entries(headers).filter(([key]) => key.startsWith('x-amz-meta-')));
 }
 
+function isPostPolicyUpload(ctx: S3RequestContext): boolean {
+  const body = toBuffer(ctx.req.body).toString('utf-8').toLowerCase();
+  return ctx.headers['content-type']?.toLowerCase().includes('multipart/form-data') === true && body.includes('x-amz-credential');
+}
+
+function parsePostPolicyFields(body: unknown): Record<string, string | undefined> {
+  return parsePostPolicyForm(body).fields;
+}
+
+function parsePostPolicyForm(body: unknown): { fields: Record<string, string>; file?: { filename?: string; body: Buffer } } {
+  const buffer = toBuffer(body);
+  const fields: Record<string, string> = {};
+  const marker = Buffer.from('\r\n\r\n');
+  const segments = buffer.toString('binary').split(/\r\n--[^\r\n]+/g);
+
+  for (const segment of segments) {
+    const part = Buffer.from(segment, 'binary');
+    const markerIndex = part.indexOf(marker);
+    if (markerIndex === -1) continue;
+    const rawHeaders = part.slice(0, markerIndex).toString('utf-8');
+    const content = trimMultipartPartBody(part.slice(markerIndex + marker.length));
+    const name = rawHeaders.match(/name="([^"]+)"/)?.[1];
+    if (!name) continue;
+    const filename = rawHeaders.match(/filename="([^"]*)"/)?.[1];
+    if (filename !== undefined || name === 'file') {
+      return { fields, file: { filename, body: content } };
+    }
+    fields[name] = content.toString('utf-8');
+  }
+
+  return { fields };
+}
+
+function trimMultipartPartBody(body: Buffer): Buffer {
+  let end = body.length;
+  while (end > 0 && (body[end - 1] === 10 || body[end - 1] === 13 || body[end - 1] === 45)) end -= 1;
+  return body.slice(0, end);
+}
+
+function decodeStreamingPayloadIfNeeded(headers: Record<string, string>, body: unknown): Buffer {
+  const buffer = toBuffer(body);
+  const payloadMarker = headers['x-amz-content-sha256'];
+  if (!payloadMarker?.startsWith('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) return buffer;
+  return decodeAwsChunkedBody(buffer);
+}
+
+function decodeAwsChunkedBody(body: Buffer): Buffer {
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  while (offset < body.length) {
+    const lineEnd = body.indexOf('\r\n', offset, 'utf-8');
+    if (lineEnd === -1) return body;
+    const header = body.slice(offset, lineEnd).toString('utf-8');
+    const sizeHex = header.split(';')[0];
+    const size = parseInt(sizeHex, 16);
+    if (!Number.isFinite(size)) return body;
+    offset = lineEnd + 2;
+    if (size === 0) break;
+    chunks.push(body.slice(offset, offset + size));
+    offset += size + 2;
+  }
+  return Buffer.concat(chunks);
+}
+
 function toBuffer(body: unknown): Buffer {
   if (Buffer.isBuffer(body)) return body;
   if (typeof body === 'string') return Buffer.from(body);
@@ -578,6 +698,16 @@ function completeMultipartUploadXml(bucket: string, key: string, etag: string): 
   <Key>${escapeXml(key)}</Key>
   <ETag>${escapeXml(etag)}</ETag>
 </CompleteMultipartUploadResult>`;
+}
+
+function postPolicyUploadXml(bucket: string, key: string, etag: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<PostResponse>
+  <Location>/${escapeXml(bucket)}/${escapeXml(key)}</Location>
+  <Bucket>${escapeXml(bucket)}</Bucket>
+  <Key>${escapeXml(key)}</Key>
+  <ETag>${escapeXml(etag)}</ETag>
+</PostResponse>`;
 }
 
 function listPartsXml(bucket: string, key: string, uploadId: string, state: MultipartUploadState): string {

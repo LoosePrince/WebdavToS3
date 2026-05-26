@@ -9,6 +9,7 @@ import { TenantRegistry, type Tenant } from '../src/tenancy/tenant-registry.js';
 const REGION = 'us-east-1';
 const ACCESS_KEY = 'AKIAUNIID002';
 const SECRET_KEY = 'f0rUn11dS3cr3tK3yP4s5';
+const SESSION_TOKEN = 'local-session-token';
 const EMPTY_BODY_SHA256 = createHash('sha256').update('').digest('hex');
 
 interface RunningWebdav {
@@ -112,6 +113,12 @@ function createApp(endpoint: string): FastifyInstance {
   return buildApp({ tenantRegistry: registry, adminKey: 'test-admin-key' });
 }
 
+function createSessionTokenApp(endpoint: string): FastifyInstance {
+  const registry = new TenantRegistry();
+  registry.add({ ...createTenant(endpoint), sessionToken: SESSION_TOKEN });
+  return buildApp({ tenantRegistry: registry, adminKey: 'test-admin-key' });
+}
+
 function signRequest(params: {
   method: string;
   pathname: string;
@@ -189,6 +196,65 @@ function createPresignedQuery(params: {
   ].join('\n');
   const signature = createHmac('sha256', deriveSigningKey(SECRET_KEY, dateStamp, REGION)).update(stringToSign).digest('hex');
   return `${baseQuery}&X-Amz-Signature=${signature}`;
+}
+
+function createPostPolicyForm(fields: Record<string, string>, file: Buffer): Buffer {
+  const boundary = '----webdavtos3-test-boundary';
+  const parts = Object.entries(fields).map(([name, value]) => multipartField(boundary, name, value));
+  parts.push(
+    Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="upload.txt"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      file,
+      Buffer.from('\r\n'),
+    ]),
+  );
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
+  return Buffer.concat(parts);
+}
+
+function postPolicyHeaders(body: Buffer): Record<string, string> {
+  return {
+    host: '127.0.0.1',
+    'content-type': 'multipart/form-data; boundary=----webdavtos3-test-boundary',
+    'content-length': String(body.length),
+  };
+}
+
+function createPostPolicyFields(key: string): Record<string, string> {
+  const amzDate = new Date().toISOString().replace(/[:-]/g, '').split('.')[0] + 'Z';
+  const dateStamp = amzDate.slice(0, 8);
+  const credential = `${ACCESS_KEY}/${dateStamp}/${REGION}/s3/aws4_request`;
+  const policy = Buffer.from(JSON.stringify({
+    expiration: new Date(Date.now() + 300_000).toISOString(),
+    conditions: [
+      { bucket: 'uniid' },
+      { key },
+      { 'x-amz-algorithm': 'AWS4-HMAC-SHA256' },
+      { 'x-amz-credential': credential },
+      { 'x-amz-date': amzDate },
+    ],
+  })).toString('base64');
+  const signature = createHmac('sha256', deriveSigningKey(SECRET_KEY, dateStamp, REGION)).update(policy).digest('hex');
+  return {
+    key,
+    Policy: policy,
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': credential,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Signature': signature,
+  };
+}
+
+function multipartField(boundary: string, name: string, value: string): Buffer {
+  return Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
+}
+
+function awsChunkedBody(data: Buffer): Buffer {
+  return Buffer.concat([
+    Buffer.from(`${data.length.toString(16)};chunk-signature=${'0'.repeat(64)}\r\n`),
+    data,
+    Buffer.from(`\r\n0;chunk-signature=${'0'.repeat(64)}\r\n\r\n`),
+  ]);
 }
 
 function buildCanonicalQueryString(queryString: string): string {
@@ -452,5 +518,97 @@ describe('S3 compatibility flows', () => {
     });
     expect(getResponse.statusCode).toBe(200);
     expect(getResponse.body).toBe('presigned-body');
+  });
+
+  it('requires configured session tokens for signed requests', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createSessionTokenApp(webdav.endpoint);
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const okResponse = await app.inject({
+      method: 'HEAD',
+      url: '/uniid',
+      headers: signRequest({
+        method: 'HEAD',
+        pathname: '/uniid',
+        host,
+        extraHeaders: {
+          'x-amz-security-token': SESSION_TOKEN,
+        },
+      }),
+    });
+    expect(okResponse.statusCode).toBe(200);
+
+    const deniedResponse = await app.inject({
+      method: 'HEAD',
+      url: '/uniid',
+      headers: signRequest({ method: 'HEAD', pathname: '/uniid', host }),
+    });
+    expect(deniedResponse.statusCode).toBe(403);
+    expect(deniedResponse.body).toContain('Missing security token');
+  });
+
+  it('accepts SigV4 streaming payload identifiers for SDK chunked uploads', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const pathname = '/uniid/streaming-marker.txt';
+    const decoded = Buffer.from('streaming-compatible-body');
+    const body = awsChunkedBody(decoded);
+    const response = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: body,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+        extraHeaders: {
+          'content-length': String(body.length),
+          'x-amz-decoded-content-length': String(decoded.length),
+        },
+      }),
+    });
+    expect(response.statusCode).toBe(200);
+
+    const readResponse = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(readResponse.statusCode).toBe(200);
+    expect(readResponse.body).toBe('streaming-compatible-body');
+  });
+
+  it('accepts browser POST policy uploads', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+
+    const key = 'post-policy-object.txt';
+    const body = createPostPolicyForm(createPostPolicyFields(key), Buffer.from('post-policy-body'));
+    const uploadResponse = await app.inject({
+      method: 'POST',
+      url: '/uniid',
+      payload: body,
+      headers: postPolicyHeaders(body),
+    });
+    expect(uploadResponse.statusCode).toBe(204);
+
+    const readPathname = `/uniid/${key}`;
+    const readResponse = await app.inject({
+      method: 'GET',
+      url: readPathname,
+      headers: signRequest({ method: 'GET', pathname: readPathname, host: '127.0.0.1' }),
+    });
+    expect(readResponse.statusCode).toBe(200);
+    expect(readResponse.body).toBe('post-policy-body');
   });
 });

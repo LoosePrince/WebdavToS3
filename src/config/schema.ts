@@ -21,6 +21,7 @@ const TenantConfigSchema = z.object({
   id: z.string().min(1),
   accessKeyId: z.string().min(1),
   secretAccessKey: z.string().min(1),
+  sessionToken: z.string().min(1).optional(),
   upstreams: z.array(WebdavUpstreamSchema).min(1),
   buckets: z.array(BucketBindingSchema).min(1),
 });

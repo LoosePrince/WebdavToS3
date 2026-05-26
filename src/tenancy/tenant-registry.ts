@@ -2,6 +2,7 @@ export interface Tenant {
   id: string;
   accessKeyId: string;
   secretAccessKey: string;
+  sessionToken?: string;
   upstreams: Map<string, UpstreamBinding>;
   buckets: Map<string, BucketBinding>;
 }
