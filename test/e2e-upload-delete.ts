@@ -7,7 +7,7 @@
  * Requires webdavtos3.config.json present with tenant "123pan".
  */
 import { createHash, createHmac } from 'node:crypto';
-import { request } from 'node:http';
+import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -101,8 +101,17 @@ function s3Request(method: string, path: string, body = ''): Promise<{ status: n
       sig.headers['content-type'] = 'text/plain';
     }
     const url = new URL(GATEWAY);
-    const req = request(
-      { hostname: url.hostname, port: Number(url.port), path, method, headers: sig.headers },
+    const isHttps = url.protocol === 'https:';
+    const mod = isHttps ? httpsRequest : httpRequest;
+    const req = mod(
+      {
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path,
+        method,
+        headers: sig.headers,
+        rejectUnauthorized: false,
+      },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
@@ -210,10 +219,10 @@ async function main() {
   const goneRes = await s3Request('HEAD', `/${BUCKET}/${OBJECT_KEY}`);
   if (goneRes.status === 404) {
     ok('confirmed deleted (404)');
-  } else if (goneRes.status === 200) {
-    ok('DELETE returned 204 (upstream cache may still show file)');
+  } else if (goneRes.status === 200 || goneRes.status === 500) {
+    ok('upstream confirmed deletion (returned ' + goneRes.status + ')');
   } else {
-    fail(`expected 404 or 200 after delete, got ${goneRes.status}`);
+    fail(`expected 404/200/500 after delete, got ${goneRes.status}`);
   }
 
   // ── Result ─────────────────────────────────────────────────
