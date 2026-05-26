@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.git/
+.github/
+test/
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!webdavtos3.config.example.json
+webdavtos3.config.json
+.env
+*.log
