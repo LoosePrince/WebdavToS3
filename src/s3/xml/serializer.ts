@@ -71,7 +71,7 @@ export function listObjectsV2Xml(result: ListObjectsV2Result): string {
         'Contents',
         [
           tag('Key', c.key),
-          tag('LastModified', c.lastModified),
+          tag('LastModified', new Date(c.lastModified).toISOString()),
           tag('ETag', c.etag),
           tag('Size', String(c.size)),
           tag('StorageClass', c.storageClass),

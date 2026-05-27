@@ -38,6 +38,13 @@ const S3ConfigSchema = z.object({
   region: z.string().default('us-east-1'),
 });
 
+const LifecycleConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  intervalMs: z.number().positive().default(3600000),
+  expireNoncurrentVersionsAfterMs: z.number().positive().optional(),
+  expireDeleteMarkersAfterMs: z.number().positive().optional(),
+});
+
 export const AppConfigSchema = z.object({
   server: ServerConfigSchema.optional().default({
     host: '0.0.0.0',
@@ -47,6 +54,7 @@ export const AppConfigSchema = z.object({
     requestTimeoutMs: 300000,
   }),
   s3: S3ConfigSchema.optional().default({ region: 'us-east-1' }),
+  lifecycle: LifecycleConfigSchema.optional().default({ enabled: false, intervalMs: 3600000 }),
   tenants: z.array(TenantConfigSchema).min(1),
 });
 

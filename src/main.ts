@@ -8,6 +8,7 @@ import {
   type BucketBinding,
 } from './tenancy/tenant-registry.js';
 import { info, error } from './observability/logger.js';
+import { startLifecycleWorker } from './s3/lifecycle/worker.js';
 
 function buildTenantRegistry(): TenantRegistry {
   const config = loadConfig();
@@ -60,6 +61,7 @@ async function main() {
     const adminKey = generateAdminKey();
 
     const app = buildApp({ tenantRegistry, adminKey });
+    startLifecycleWorker(tenantRegistry, config.lifecycle);
 
     await app.listen({
       host: config.server.host,

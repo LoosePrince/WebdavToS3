@@ -58,6 +58,7 @@ function sanitizeConfig(config: import('../config/schema.js').AppConfig) {
   return {
     server: editableServer,
     s3: config.s3,
+    lifecycle: config.lifecycle,
     tenants: config.tenants.map((t) => ({
       id: t.id,
       accessKeyId: t.accessKeyId,

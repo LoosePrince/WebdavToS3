@@ -22,10 +22,16 @@ export async function getObject(
     if (rangeHeader) headers['range'] = rangeHeader;
 
     const resp = await client.request('GET', webdavPath, { headers });
+    if (resp.statusCode === 404) {
+      throw new S3OperationError('NoSuchKey', 'The specified key does not exist.', 404);
+    }
+    if (resp.statusCode >= 400) {
+      throw new S3OperationError('InternalError', `GET object failed: ${resp.statusCode}`, 500);
+    }
 
     const responseHeaders: Record<string, string> = {
       'content-type': resp.headers['content-type'] ?? 'application/octet-stream',
-      'content-length': resp.headers['content-length'] ?? '',
+      'content-length': resp.headers['content-length'] ?? String(resp.body.length),
       'etag': resp.headers['etag'] ?? '',
       'last-modified': resp.headers['last-modified'] ?? '',
       'x-amz-request-id': '',

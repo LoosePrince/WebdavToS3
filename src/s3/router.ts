@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { FastifyRequest, FastifyReply } from 'fastify';
 import {
   verifySigV4,
@@ -14,7 +15,6 @@ import {
   putObject,
   headObject,
   deleteObject,
-  copyObject,
   listObjectsV2,
   listBuckets,
   S3OperationError,
@@ -28,7 +28,7 @@ import {
   escapeXml,
 } from './xml/serializer.js';
 import { getRequestId } from '../observability/request-context.js';
-import { S3StateStore, type BucketState, type MultipartUploadState } from './state/store.js';
+import { S3StateStore, type BucketState, type MultipartUploadState, type ObjectMetadataState, type ObjectVersionState } from './state/store.js';
 
 interface AuthResult {
   ok: boolean;
@@ -84,7 +84,7 @@ export async function handleS3Request(
     if (auth.accessKey !== ctx.ownerTenant?.accessKeyId) {
       return sendS3Error(reply, 'AccessDenied', 'Access denied', 403, ctx.requestId);
     }
-    return handlePostPolicyUpload(ctx);
+    return await handlePostPolicyUpload(ctx);
   }
 
   const auth = authenticateRequest(ctx.headers, ctx.method, ctx.pathname, ctx.rawQueryString, tenantRegistry);
@@ -96,90 +96,99 @@ export async function handleS3Request(
   try {
     switch (resolveOperation(ctx)) {
       case 'HeadBucket':
-        return handleHeadBucket(ctx);
+        return await handleHeadBucket(ctx);
       case 'CreateBucket':
-        return handleCreateBucket(ctx);
+        return await handleCreateBucket(ctx);
       case 'DeleteBucket':
-        return handleDeleteBucket(ctx);
+        return await handleDeleteBucket(ctx);
       case 'GetBucketLocation':
         return ctx.reply.status(200).headers(XML_HEADERS).send(locationXml(ctx.bucket.region));
       case 'ListObjects':
-        return handleListObjects(ctx);
+        return await handleListObjects(ctx);
       case 'ListObjectVersions':
-        return sendXml(ctx, 200, versionsXml(ctx.bucket.name));
+        return await handleListObjectVersions(ctx);
       case 'GetBucketAcl':
         return sendXml(ctx, 200, aclXml());
       case 'PutBucketAcl':
         return sendEmpty(ctx, 200);
       case 'GetBucketVersioning':
-        return handleGetBucketVersioning(ctx);
+        return await handleGetBucketVersioning(ctx);
       case 'PutBucketVersioning':
-        return handlePutBucketVersioning(ctx);
+        return await handlePutBucketVersioning(ctx);
       case 'GetBucketPolicy':
-        return handleGetJsonControl(ctx, 'policy');
+        return await handleGetJsonControl(ctx, 'policy');
       case 'PutBucketPolicy':
-        return handlePutJsonControl(ctx, 'policy');
+        return await handlePutJsonControl(ctx, 'policy');
       case 'DeleteBucketPolicy':
-        return handleDeleteJsonControl(ctx, 'policy');
+        return await handleDeleteJsonControl(ctx, 'policy');
       case 'GetBucketCors':
-        return handleGetXmlControl(ctx, 'cors', corsXml());
+        return await handleGetXmlControl(ctx, 'cors', corsXml());
       case 'PutBucketCors':
-        return handlePutJsonControl(ctx, 'cors');
+        return await handlePutJsonControl(ctx, 'cors');
       case 'DeleteBucketCors':
-        return handleDeleteJsonControl(ctx, 'cors');
+        return await handleDeleteJsonControl(ctx, 'cors');
       case 'GetBucketTagging':
-        return handleGetBucketTagging(ctx);
+        return await handleGetBucketTagging(ctx);
       case 'PutBucketTagging':
-        return handlePutJsonControl(ctx, 'tagging');
+        return await handlePutJsonControl(ctx, 'tagging');
       case 'DeleteBucketTagging':
-        return handleDeleteJsonControl(ctx, 'tagging');
+        return await handleDeleteJsonControl(ctx, 'tagging');
       case 'GetBucketLifecycle':
-        return handleGetXmlControl(ctx, 'lifecycle', lifecycleXml());
+        return await handleGetXmlControl(ctx, 'lifecycle', lifecycleXml());
       case 'PutBucketLifecycle':
-        return handlePutJsonControl(ctx, 'lifecycle');
+        return await handlePutJsonControl(ctx, 'lifecycle');
       case 'DeleteBucketLifecycle':
-        return handleDeleteJsonControl(ctx, 'lifecycle');
+        return await handleDeleteJsonControl(ctx, 'lifecycle');
       case 'GetBucketEncryption':
-        return handleGetXmlControl(ctx, 'encryption', encryptionXml());
+        return await handleGetXmlControl(ctx, 'encryption', encryptionXml());
       case 'PutBucketEncryption':
-        return handlePutJsonControl(ctx, 'encryption');
+        return await handlePutJsonControl(ctx, 'encryption');
       case 'DeleteBucketEncryption':
-        return handleDeleteJsonControl(ctx, 'encryption');
+        return await handleDeleteJsonControl(ctx, 'encryption');
       case 'GetPublicAccessBlock':
-        return handleGetXmlControl(ctx, 'publicAccessBlock', publicAccessBlockXml());
+        return await handleGetXmlControl(ctx, 'publicAccessBlock', publicAccessBlockXml());
       case 'PutPublicAccessBlock':
-        return handlePutJsonControl(ctx, 'publicAccessBlock');
+        return await handlePutJsonControl(ctx, 'publicAccessBlock');
       case 'DeletePublicAccessBlock':
-        return handleDeleteJsonControl(ctx, 'publicAccessBlock');
+        return await handleDeleteJsonControl(ctx, 'publicAccessBlock');
       case 'CreateMultipartUpload':
-        return handleCreateMultipartUpload(ctx);
+        return await handleCreateMultipartUpload(ctx);
       case 'UploadPart':
-        return handleUploadPart(ctx);
+        return await handleUploadPart(ctx);
       case 'CompleteMultipartUpload':
-        return handleCompleteMultipartUpload(ctx);
+        return await handleCompleteMultipartUpload(ctx);
       case 'AbortMultipartUpload':
-        return handleAbortMultipartUpload(ctx);
+        return await handleAbortMultipartUpload(ctx);
       case 'ListParts':
-        return handleListParts(ctx);
+        return await handleListParts(ctx);
       case 'ListMultipartUploads':
         return sendXml(ctx, 200, multipartUploadsXml(ctx.bucket.name));
       case 'DeleteObjects':
         return sendXml(ctx, 200, '<?xml version="1.0" encoding="UTF-8"?>\n<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>');
       case 'GetObjectTagging':
-        return sendXml(ctx, 200, taggingXml({}));
+        return await handleGetObjectTagging(ctx);
       case 'PutObjectTagging':
+        return await handlePutObjectTagging(ctx);
       case 'DeleteObjectTagging':
-        return sendEmpty(ctx, 204);
+        return await handleDeleteObjectTagging(ctx);
+      case 'GetObjectLegalHold':
+        return await handleGetObjectLegalHold(ctx);
+      case 'PutObjectLegalHold':
+        return await handlePutObjectLegalHold(ctx);
+      case 'GetObjectRetention':
+        return await handleGetObjectRetention(ctx);
+      case 'PutObjectRetention':
+        return await handlePutObjectRetention(ctx);
       case 'GetObject':
-        return handleGetObject(ctx);
+        return await handleGetObject(ctx);
       case 'HeadObject':
-        return handleHeadObject(ctx);
+        return await handleHeadObject(ctx);
       case 'PutObject':
-        return handlePutObject(ctx);
+        return await handlePutObject(ctx);
       case 'DeleteObject':
-        return handleDeleteObject(ctx);
+        return await handleDeleteObject(ctx);
       case 'CopyObject':
-        return handleCopyObject(ctx);
+        return await handleCopyObject(ctx);
       default:
         return sendS3Error(reply, 'NotImplemented', 'Operation not implemented', 501, ctx.requestId);
     }
@@ -244,9 +253,6 @@ function resolveOperation(ctx: S3RequestContext): string {
   const has = (name: string) => Object.prototype.hasOwnProperty.call(q, name);
 
   if (!ctx.key) {
-    if (ctx.method === 'HEAD') return 'HeadBucket';
-    if (ctx.method === 'PUT') return 'CreateBucket';
-    if (ctx.method === 'DELETE') return 'DeleteBucket';
     if (ctx.method === 'POST' && has('delete')) return 'DeleteObjects';
     if (ctx.method === 'GET' && has('location')) return 'GetBucketLocation';
     if (ctx.method === 'GET' && has('versions')) return 'ListObjectVersions';
@@ -273,6 +279,9 @@ function resolveOperation(ctx: S3RequestContext): string {
     if (ctx.method === 'GET' && has('publicAccessBlock')) return 'GetPublicAccessBlock';
     if (ctx.method === 'PUT' && has('publicAccessBlock')) return 'PutPublicAccessBlock';
     if (ctx.method === 'DELETE' && has('publicAccessBlock')) return 'DeletePublicAccessBlock';
+    if (ctx.method === 'HEAD') return 'HeadBucket';
+    if (ctx.method === 'PUT') return 'CreateBucket';
+    if (ctx.method === 'DELETE') return 'DeleteBucket';
     if (ctx.method === 'GET') return 'ListObjects';
   }
 
@@ -284,6 +293,10 @@ function resolveOperation(ctx: S3RequestContext): string {
   if (ctx.method === 'GET' && has('tagging')) return 'GetObjectTagging';
   if (ctx.method === 'PUT' && has('tagging')) return 'PutObjectTagging';
   if (ctx.method === 'DELETE' && has('tagging')) return 'DeleteObjectTagging';
+  if (ctx.method === 'GET' && has('legal-hold')) return 'GetObjectLegalHold';
+  if (ctx.method === 'PUT' && has('legal-hold')) return 'PutObjectLegalHold';
+  if (ctx.method === 'GET' && has('retention')) return 'GetObjectRetention';
+  if (ctx.method === 'PUT' && has('retention')) return 'PutObjectRetention';
   if (ctx.method === 'GET') return 'GetObject';
   if (ctx.method === 'HEAD') return 'HeadObject';
   if (ctx.method === 'PUT' && ctx.headers['x-amz-copy-source']) return 'CopyObject';
@@ -294,24 +307,69 @@ function resolveOperation(ctx: S3RequestContext): string {
 }
 
 async function handleGetObject(ctx: S3RequestContext) {
+  const versionId = ctx.query.versionId;
+  if (versionId) return await handleGetObjectVersion(ctx, versionId);
+
+  const metadata = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  if (metadata?.isDeleteMarker) {
+    return sendS3Error(ctx.reply, 'NoSuchKey', 'The specified key does not exist.', 404, ctx.requestId);
+  }
+  const condition = evaluateObjectConditions(ctx.headers, metadata);
+  if (condition.status === 304) return ctx.reply.status(304).header('x-amz-request-id', ctx.requestId).send();
+  if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
+
   const result = await getObject(ctx.client!, ctx.bucket!, ctx.key, ctx.headers['range']);
   const overrideHeaders = responseOverrideHeaders(ctx.query);
   return ctx.reply
     .status(result.statusCode)
-    .headers({ ...result.headers, ...overrideHeaders, 'x-amz-request-id': ctx.requestId })
+    .headers({ ...result.headers, ...metadataHeaders(metadata), ...overrideHeaders, 'x-amz-request-id': ctx.requestId })
     .send(result.body);
 }
 
 async function handleHeadObject(ctx: S3RequestContext) {
+  const versionId = ctx.query.versionId;
+  if (versionId) return await handleHeadObjectVersion(ctx, versionId);
+
+  const metadata = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  if (metadata?.isDeleteMarker) {
+    return sendS3Error(ctx.reply, 'NoSuchKey', 'The specified key does not exist.', 404, ctx.requestId);
+  }
+  const condition = evaluateObjectConditions(ctx.headers, metadata);
+  if (condition.status === 304) return ctx.reply.status(304).header('x-amz-request-id', ctx.requestId).send();
+  if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
+
   const result = await headObject(ctx.client!, ctx.bucket!, ctx.key);
-  return ctx.reply.status(result.statusCode).headers({ ...result.headers, 'x-amz-request-id': ctx.requestId }).send();
+  return ctx.reply.status(result.statusCode).headers({ ...result.headers, ...metadataHeaders(metadata), 'x-amz-request-id': ctx.requestId }).send();
 }
 
 async function handlePutObject(ctx: S3RequestContext) {
   const body = decodeStreamingPayloadIfNeeded(ctx.headers, ctx.req.body);
   const contentLength = body.length || (ctx.headers['content-length'] ? parseInt(ctx.headers['content-length'], 10) : undefined);
+  const checksumError = validateChecksums(ctx.headers, body);
+  if (checksumError) return sendS3Error(ctx.reply, checksumError.code, checksumError.message, 400, ctx.requestId);
+
+  const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
+  const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  if (isObjectLocked(existing)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
+  const condition = evaluateObjectConditions(ctx.headers, existing?.isDeleteMarker ? null : existing);
+  if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
+
   const result = await putObject(ctx.client!, ctx.bucket!, ctx.key, body, contentLength);
-  return ctx.reply.status(200).header('etag', result.etag).header('x-amz-request-id', ctx.requestId).send();
+  const versionId = bucketState.versioning === 'Enabled' ? createVersionId(ctx.bucketName!, ctx.key) : undefined;
+  const metadata = buildObjectMetadata(ctx, result.etag, body.length, existing?.isDeleteMarker ? parseTaggingHeader(ctx.headers['x-amz-tagging']) : existing?.tagging ?? parseTaggingHeader(ctx.headers['x-amz-tagging']), undefined, versionId);
+  await ctx.state!.putObjectMetadata(metadata);
+  if (versionId) {
+    const bodyPath = ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
+    await ctx.client!.ensureCollection(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
+    await ctx.client!.put(bodyPath, body, body.length);
+    await ctx.state!.putObjectVersion({ ...metadata, versionId, isLatest: true, bodyPath });
+  }
+  return ctx.reply
+    .status(200)
+    .header('etag', result.etag)
+    .headers(versionId ? { 'x-amz-version-id': versionId } : {})
+    .header('x-amz-request-id', ctx.requestId)
+    .send();
 }
 
 async function handlePostPolicyUpload(ctx: S3RequestContext) {
@@ -321,6 +379,7 @@ async function handlePostPolicyUpload(ctx: S3RequestContext) {
   if (!form.file) return sendS3Error(ctx.reply, 'InvalidArgument', 'POST policy upload requires file field', 400, ctx.requestId);
 
   const result = await putObject(ctx.client!, ctx.bucket!, key, form.file.body, form.file.body.length);
+  await ctx.state!.putObjectMetadata(buildObjectMetadata({ ...ctx, key }, result.etag, form.file.body.length, parseTaggingHeader(form.fields.tagging)));
   const status = form.fields.success_action_status ? Number(form.fields.success_action_status) : 204;
   if (status === 201) {
     return sendXml(ctx, 201, postPolicyUploadXml(ctx.bucketName!, key, result.etag));
@@ -329,7 +388,42 @@ async function handlePostPolicyUpload(ctx: S3RequestContext) {
 }
 
 async function handleDeleteObject(ctx: S3RequestContext) {
+  const versionId = ctx.query.versionId;
+  if (versionId) {
+    await ctx.state!.deleteObjectVersion(ctx.bucketName!, ctx.key, versionId);
+    return ctx.reply.status(204).header('x-amz-version-id', versionId).header('x-amz-request-id', ctx.requestId).send();
+  }
+
+  const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
+  const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  if (isObjectLocked(existing)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
+  if (bucketState.versioning === 'Enabled') {
+    const deleteMarkerVersionId = createVersionId(ctx.bucketName!, `${ctx.key}:delete`);
+    const marker: ObjectVersionState = {
+      bucket: ctx.bucketName!,
+      key: ctx.key,
+      etag: '',
+      size: 0,
+      lastModified: new Date().toISOString(),
+      contentType: 'application/octet-stream',
+      userMetadata: {},
+      tagging: {},
+      versionId: deleteMarkerVersionId,
+      isLatest: true,
+      isDeleteMarker: true,
+    };
+    await ctx.state!.putObjectMetadata(marker);
+    await ctx.state!.putObjectVersion(marker);
+    return ctx.reply
+      .status(204)
+      .header('x-amz-delete-marker', 'true')
+      .header('x-amz-version-id', deleteMarkerVersionId)
+      .header('x-amz-request-id', ctx.requestId)
+      .send();
+  }
+
   await deleteObject(ctx.client!, ctx.bucket!, ctx.key);
+  await ctx.state!.deleteObjectMetadata(ctx.bucketName!, ctx.key);
   return ctx.reply.status(204).header('x-amz-request-id', ctx.requestId).send();
 }
 
@@ -340,11 +434,42 @@ async function handleCopyObject(ctx: S3RequestContext) {
   const parts = sourcePath.split('/');
   const sourceBucket = decodeURIComponent(parts[0]);
   const sourceKey = parts.slice(1).map(decodeURIComponent).join('/');
-  if (sourceBucket !== ctx.bucket!.name) {
-    return sendS3Error(ctx.reply, 'InvalidRequest', 'Cross-bucket copy not yet supported', 400, ctx.requestId);
+  const sourceTenant = findTenantByBucket(ctx.registry, sourceBucket);
+  const sourceBucketBinding = sourceTenant?.buckets.get(sourceBucket);
+  const sourceUpstream = sourceBucketBinding ? sourceTenant?.upstreams.get(sourceBucketBinding.upstreamId) : undefined;
+  if (!sourceTenant || !sourceBucketBinding || !sourceUpstream) {
+    return sendS3Error(ctx.reply, 'NoSuchBucket', 'The source bucket does not exist', 404, ctx.requestId);
   }
-  const result = await copyObject(ctx.client!, ctx.bucket!, sourceKey, ctx.key);
-  return ctx.reply.status(200).headers(XML_HEADERS).send(copyObjectXml({ etag: result.etag, lastModified: result.lastModified }));
+
+  const sourceClient = sourceBucket === ctx.bucket!.name
+    ? ctx.client!
+    : new WebdavClient({
+        endpoint: sourceUpstream.endpoint,
+        username: sourceUpstream.username,
+        password: sourceUpstream.password,
+        rejectUnauthorized: sourceUpstream.rejectUnauthorized,
+        connectTimeoutMs: sourceUpstream.connectTimeoutMs,
+        requestTimeoutMs: sourceUpstream.requestTimeoutMs,
+      });
+  const sourceState = sourceBucket === ctx.bucket!.name ? ctx.state! : new S3StateStore(sourceClient);
+  const sourceMetadata = await sourceState.getObjectMetadata(sourceBucket, sourceKey);
+  const condition = evaluateCopySourceConditions(ctx.headers, sourceMetadata);
+  if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
+
+  const sourceObject = await getObject(sourceClient, sourceBucketBinding, sourceKey);
+  const sourceBody = await readableToBuffer(sourceObject.body);
+  const result = await putObject(ctx.client!, ctx.bucket!, ctx.key, sourceBody, sourceBody.length);
+  const directive = ctx.headers['x-amz-metadata-directive']?.toUpperCase();
+  const taggingDirective = ctx.headers['x-amz-tagging-directive']?.toUpperCase();
+  const metadata = buildObjectMetadata(
+    ctx,
+    result.etag,
+    sourceBody.length,
+    taggingDirective === 'REPLACE' ? parseTaggingHeader(ctx.headers['x-amz-tagging']) : sourceMetadata?.tagging ?? {},
+    directive === 'REPLACE' ? undefined : sourceMetadata ?? undefined,
+  );
+  await ctx.state!.putObjectMetadata(metadata);
+  return ctx.reply.status(200).headers(XML_HEADERS).send(copyObjectXml({ etag: result.etag, lastModified: metadata.lastModified }));
 }
 
 async function handleListObjects(ctx: S3RequestContext) {
@@ -355,6 +480,44 @@ async function handleListObjects(ctx: S3RequestContext) {
     continuationToken: ctx.query['continuation-token'] ?? ctx.query.marker,
   });
   return ctx.reply.status(200).headers(XML_HEADERS).send(listObjectsV2Xml(result));
+}
+
+async function handleListObjectVersions(ctx: S3RequestContext) {
+  const versions = await ctx.state!.listObjectVersions(ctx.bucketName!);
+  return sendXml(ctx, 200, versionsXml(ctx.bucketName!, versions));
+}
+
+async function handleGetObjectVersion(ctx: S3RequestContext, versionId: string) {
+  const version = await ctx.state!.getObjectVersion(ctx.bucketName!, ctx.key, versionId);
+  if (!version) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version does not exist.', 404, ctx.requestId);
+  if (version.isDeleteMarker) {
+    return ctx.reply
+      .status(405)
+      .headers({ ...metadataHeaders(version), 'x-amz-delete-marker': 'true', 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+      .send();
+  }
+  if (!version.bodyPath) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version body does not exist.', 404, ctx.requestId);
+  const resp = await ctx.client!.get(version.bodyPath);
+  if (resp.statusCode >= 400) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version body does not exist.', 404, ctx.requestId);
+  return ctx.reply
+    .status(200)
+    .headers({ ...metadataHeaders(version), 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+    .send(resp.body);
+}
+
+async function handleHeadObjectVersion(ctx: S3RequestContext, versionId: string) {
+  const version = await ctx.state!.getObjectVersion(ctx.bucketName!, ctx.key, versionId);
+  if (!version) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version does not exist.', 404, ctx.requestId);
+  if (version.isDeleteMarker) {
+    return ctx.reply
+      .status(405)
+      .headers({ ...metadataHeaders(version), 'x-amz-delete-marker': 'true', 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+      .send();
+  }
+  return ctx.reply
+    .status(200)
+    .headers({ ...metadataHeaders(version), 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+    .send();
 }
 
 function handleHeadBucket(ctx: S3RequestContext) {
@@ -413,6 +576,64 @@ async function handleGetXmlControl(ctx: S3RequestContext, key: keyof BucketState
 async function handleGetBucketTagging(ctx: S3RequestContext) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
   return sendXml(ctx, 200, taggingXml(state.tagging ?? {}));
+}
+
+async function handleGetObjectTagging(ctx: S3RequestContext) {
+  const metadata = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  return sendXml(ctx, 200, taggingXml(metadata?.tagging ?? {}));
+}
+
+async function handlePutObjectTagging(ctx: S3RequestContext) {
+  const metadata = await requireObjectMetadata(ctx);
+  if (!metadata) return;
+  metadata.tagging = parseTaggingXml(await requestBodyText(ctx.req.body));
+  await ctx.state!.putObjectMetadata(metadata);
+  return sendEmpty(ctx, 200);
+}
+
+async function handleDeleteObjectTagging(ctx: S3RequestContext) {
+  const metadata = await requireObjectMetadata(ctx);
+  if (!metadata) return;
+  metadata.tagging = {};
+  await ctx.state!.putObjectMetadata(metadata);
+  return sendEmpty(ctx, 204);
+}
+
+async function handleGetObjectLegalHold(ctx: S3RequestContext) {
+  const metadata = await requireObjectMetadata(ctx);
+  if (!metadata) return;
+  return sendXml(ctx, 200, legalHoldXml(metadata.objectLock?.legalHold ?? 'OFF'));
+}
+
+async function handlePutObjectLegalHold(ctx: S3RequestContext) {
+  const metadata = await requireObjectMetadata(ctx);
+  if (!metadata) return;
+  const body = await requestBodyText(ctx.req.body);
+  metadata.objectLock = {
+    ...(metadata.objectLock ?? {}),
+    legalHold: body.includes('<Status>ON</Status>') ? 'ON' : 'OFF',
+  };
+  await ctx.state!.putObjectMetadata(metadata);
+  return sendEmpty(ctx, 200);
+}
+
+async function handleGetObjectRetention(ctx: S3RequestContext) {
+  const metadata = await requireObjectMetadata(ctx);
+  if (!metadata) return;
+  return sendXml(ctx, 200, retentionXml(metadata.objectLock?.mode, metadata.objectLock?.retainUntilDate));
+}
+
+async function handlePutObjectRetention(ctx: S3RequestContext) {
+  const metadata = await requireObjectMetadata(ctx);
+  if (!metadata) return;
+  const body = await requestBodyText(ctx.req.body);
+  metadata.objectLock = {
+    ...(metadata.objectLock ?? {}),
+    mode: extractXmlValue(body, 'Mode') ?? metadata.objectLock?.mode ?? 'GOVERNANCE',
+    retainUntilDate: extractXmlValue(body, 'RetainUntilDate') ?? metadata.objectLock?.retainUntilDate,
+  };
+  await ctx.state!.putObjectMetadata(metadata);
+  return sendEmpty(ctx, 200);
 }
 
 async function handleCreateMultipartUpload(ctx: S3RequestContext) {
@@ -490,6 +711,27 @@ async function requireMultipart(ctx: S3RequestContext, uploadId: string): Promis
     return null;
   }
   return state;
+}
+
+async function requireObjectMetadata(ctx: S3RequestContext): Promise<ObjectMetadataState | null> {
+  const metadata = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  if (metadata) return metadata;
+  try {
+    const head = await headObject(ctx.client!, ctx.bucket!, ctx.key);
+    return {
+      bucket: ctx.bucketName!,
+      key: ctx.key,
+      etag: head.headers.etag ?? '',
+      size: Number(head.headers['content-length'] ?? 0),
+      lastModified: head.headers['last-modified'] ?? new Date().toISOString(),
+      contentType: head.headers['content-type'] ?? 'application/octet-stream',
+      userMetadata: {},
+      tagging: {},
+    };
+  } catch {
+    sendS3Error(ctx.reply, 'NoSuchKey', 'The specified key does not exist.', 404, ctx.requestId);
+    return null;
+  }
 }
 
 function authenticateRequest(
@@ -586,7 +828,125 @@ function responseOverrideHeaders(query: Record<string, string | undefined>): Rec
 }
 
 function collectUserMetadata(headers: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(Object.entries(headers).filter(([key]) => key.startsWith('x-amz-meta-')));
+  return Object.fromEntries(
+    Object.entries(headers)
+      .filter(([key]) => key.startsWith('x-amz-meta-'))
+      .map(([key, value]) => [key.slice('x-amz-meta-'.length), value]),
+  );
+}
+
+function buildObjectMetadata(
+  ctx: S3RequestContext,
+  etag: string,
+  size: number,
+  tagging: Record<string, string>,
+  source?: ObjectMetadataState,
+  versionId?: string,
+): ObjectMetadataState {
+  return {
+    bucket: ctx.bucketName!,
+    key: ctx.key,
+    etag,
+    size,
+    lastModified: new Date().toISOString(),
+    contentType: ctx.headers['content-type'] ?? source?.contentType ?? 'application/octet-stream',
+    userMetadata: Object.keys(collectUserMetadata(ctx.headers)).length > 0 ? collectUserMetadata(ctx.headers) : source?.userMetadata ?? {},
+    tagging,
+    storageClass: ctx.headers['x-amz-storage-class'] ?? source?.storageClass,
+    checksum: collectChecksums(ctx.headers),
+    versionId: versionId ?? source?.versionId,
+    objectLock: source?.objectLock,
+  };
+}
+
+function metadataHeaders(metadata: ObjectMetadataState | null): Record<string, string> {
+  if (!metadata) return {};
+  return {
+    'content-type': metadata.contentType,
+    'content-length': String(metadata.size),
+    etag: metadata.etag,
+    'last-modified': new Date(metadata.lastModified).toUTCString(),
+    ...(metadata.storageClass ? { 'x-amz-storage-class': metadata.storageClass } : {}),
+    ...(metadata.versionId ? { 'x-amz-version-id': metadata.versionId } : {}),
+    ...(metadata.isDeleteMarker ? { 'x-amz-delete-marker': 'true' } : {}),
+    ...Object.fromEntries(Object.entries(metadata.userMetadata).map(([key, value]) => [`x-amz-meta-${key}`, value])),
+    ...Object.fromEntries(Object.entries(metadata.checksum ?? {}).map(([key, value]) => [`x-amz-checksum-${key}`, value])),
+  };
+}
+
+function evaluateObjectConditions(headers: Record<string, string>, metadata: ObjectMetadataState | null): { status?: 304 | 412 } {
+  if (!metadata) return {};
+  const etag = metadata.etag;
+  const modifiedAt = new Date(metadata.lastModified).getTime();
+  if (headers['if-match'] && !matchEtags(headers['if-match'], etag)) return { status: 412 };
+  if (headers['if-none-match'] && matchEtags(headers['if-none-match'], etag)) return { status: headers['if-none-match'] ? 304 : 412 };
+  if (headers['if-unmodified-since'] && modifiedAt > Date.parse(headers['if-unmodified-since'])) return { status: 412 };
+  if (headers['if-modified-since'] && modifiedAt <= Date.parse(headers['if-modified-since'])) return { status: 304 };
+  return {};
+}
+
+function evaluateCopySourceConditions(headers: Record<string, string>, metadata: ObjectMetadataState | null): { status?: 412 } {
+  if (!metadata) return {};
+  const etag = metadata.etag;
+  const modifiedAt = new Date(metadata.lastModified).getTime();
+  if (headers['x-amz-copy-source-if-match'] && !matchEtags(headers['x-amz-copy-source-if-match'], etag)) return { status: 412 };
+  if (headers['x-amz-copy-source-if-none-match'] && matchEtags(headers['x-amz-copy-source-if-none-match'], etag)) return { status: 412 };
+  if (headers['x-amz-copy-source-if-unmodified-since'] && modifiedAt > Date.parse(headers['x-amz-copy-source-if-unmodified-since'])) return { status: 412 };
+  if (headers['x-amz-copy-source-if-modified-since'] && modifiedAt <= Date.parse(headers['x-amz-copy-source-if-modified-since'])) return { status: 412 };
+  return {};
+}
+
+function isObjectLocked(metadata: ObjectMetadataState | null): boolean {
+  if (!metadata?.objectLock) return false;
+  if (metadata.objectLock.legalHold === 'ON') return true;
+  if (!metadata.objectLock.retainUntilDate) return false;
+  const retainUntil = Date.parse(metadata.objectLock.retainUntilDate);
+  return Number.isFinite(retainUntil) && retainUntil > Date.now();
+}
+
+function matchEtags(condition: string, etag: string): boolean {
+  return condition.split(',').map((item) => item.trim()).some((item) => item === '*' || item === etag || item.replace(/^W\//, '') === etag);
+}
+
+function validateChecksums(headers: Record<string, string>, body: Buffer): { code: string; message: string } | null {
+  const contentMd5 = headers['content-md5'];
+  if (contentMd5 && createHash('md5').update(body).digest('base64') !== contentMd5) {
+    return { code: 'BadDigest', message: 'The Content-MD5 you specified did not match what we received' };
+  }
+  const sha256 = headers['x-amz-checksum-sha256'];
+  if (sha256 && createHash('sha256').update(body).digest('base64') !== sha256) {
+    return { code: 'BadDigest', message: 'The x-amz-checksum-sha256 you specified did not match what we received' };
+  }
+  return null;
+}
+
+function collectChecksums(headers: Record<string, string>): Record<string, string> | undefined {
+  const entries = Object.entries(headers)
+    .filter(([key]) => key.startsWith('x-amz-checksum-'))
+    .map(([key, value]) => [key.slice('x-amz-checksum-'.length), value]);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function parseTaggingHeader(header: string | undefined): Record<string, string> {
+  if (!header) return {};
+  return Object.fromEntries(new URLSearchParams(header));
+}
+
+function parseTaggingXml(xml: string): Record<string, string> {
+  const tags: Record<string, string> = {};
+  for (const match of xml.matchAll(/<Tag>\s*<Key>([\s\S]*?)<\/Key>\s*<Value>([\s\S]*?)<\/Value>\s*<\/Tag>/g)) {
+    tags[unescapeXml(match[1])] = unescapeXml(match[2]);
+  }
+  return tags;
+}
+
+function unescapeXml(value: string): string {
+  return value.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
+function extractXmlValue(xml: string, tagName: string): string | undefined {
+  const match = new RegExp(`<${tagName}>([\\s\\S]*?)</${tagName}>`).exec(xml);
+  return match ? unescapeXml(match[1]) : undefined;
 }
 
 function isPostPolicyUpload(ctx: S3RequestContext): boolean {
@@ -663,6 +1023,14 @@ async function requestBodyText(body: unknown): Promise<string> {
   return toBuffer(body).toString('utf-8');
 }
 
+async function readableToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 function safeJsonParse(body: string): unknown | null {
   try {
     return JSON.parse(body);
@@ -679,6 +1047,10 @@ function createWeakEtag(body: Buffer): string {
   let hash = 0;
   for (const byte of body) hash = ((hash << 5) - hash + byte) | 0;
   return Math.abs(hash).toString(16).padStart(8, '0');
+}
+
+function createVersionId(bucket: string, key: string): string {
+  return createHash('sha256').update(`${bucket}/${key}/${Date.now()}/${Math.random()}`).digest('hex');
 }
 
 function createMultipartUploadXml(bucket: string, key: string, uploadId: string): string {
@@ -736,11 +1108,28 @@ function versioningXml(status: BucketState['versioning']): string {
 </VersioningConfiguration>`;
 }
 
-function versionsXml(bucket: string): string {
+function versionsXml(bucket: string, versions: ObjectVersionState[]): string {
+  const entries = versions.map((version) => {
+    const common = `
+    <Key>${escapeXml(version.key)}</Key>
+    <VersionId>${escapeXml(version.versionId)}</VersionId>
+    <IsLatest>${version.isLatest ? 'true' : 'false'}</IsLatest>
+    <LastModified>${new Date(version.lastModified).toISOString()}</LastModified>`;
+    if (version.isDeleteMarker) {
+      return `  <DeleteMarker>${common}
+  </DeleteMarker>`;
+    }
+    return `  <Version>${common}
+    <ETag>${escapeXml(version.etag)}</ETag>
+    <Size>${version.size}</Size>
+    <StorageClass>${escapeXml(version.storageClass ?? 'STANDARD')}</StorageClass>
+  </Version>`;
+  }).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>${escapeXml(bucket)}</Name>
   <IsTruncated>false</IsTruncated>
+${entries}
 </ListVersionsResult>`;
 }
 
@@ -760,6 +1149,21 @@ function taggingXml(tags: Record<string, string>): string {
 ${tagSet}
   </TagSet>
 </Tagging>`;
+}
+
+function legalHoldXml(status: 'ON' | 'OFF'): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Status>${status}</Status>
+</LegalHold>`;
+}
+
+function retentionXml(mode?: string, retainUntilDate?: string): string {
+  const modeXml = mode ? `\n  <Mode>${escapeXml(mode)}</Mode>` : '';
+  const dateXml = retainUntilDate ? `\n  <RetainUntilDate>${escapeXml(retainUntilDate)}</RetainUntilDate>` : '';
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${modeXml}${dateXml}
+</Retention>`;
 }
 
 function corsXml(): string {

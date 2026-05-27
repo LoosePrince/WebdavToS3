@@ -1,20 +1,70 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createHmac, createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { FastifyInstance } from 'fastify';
+import {
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+  UploadPartCommand,
+} from '@aws-sdk/client-s3';
 import { buildApp } from '../src/http/app.js';
 import { TenantRegistry, type Tenant } from '../src/tenancy/tenant-registry.js';
+import { runLifecycleOnce } from '../src/s3/lifecycle/worker.js';
 
 const REGION = 'us-east-1';
 const ACCESS_KEY = 'AKIAUNIID002';
 const SECRET_KEY = 'f0rUn11dS3cr3tK3yP4s5';
 const SESSION_TOKEN = 'local-session-token';
 const EMPTY_BODY_SHA256 = createHash('sha256').update('').digest('hex');
+const AWS_CLI_AVAILABLE = spawnSync('aws', ['--version'], { encoding: 'utf-8', shell: true }).status === 0;
 
 interface RunningWebdav {
   endpoint: string;
   close: () => Promise<void>;
+}
+
+interface RunningS3App {
+  endpoint: string;
+  close: () => Promise<void>;
+}
+
+async function startS3App(app: FastifyInstance): Promise<RunningS3App> {
+  await app.listen({ host: '127.0.0.1', port: 0 });
+  const address = app.server.address() as AddressInfo;
+  return {
+    endpoint: `http://127.0.0.1:${address.port}`,
+    close: () => app.close(),
+  };
+}
+
+function createAwsSdkClient(endpoint: string): S3Client {
+  return new S3Client({
+    endpoint,
+    region: REGION,
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: ACCESS_KEY,
+      secretAccessKey: SECRET_KEY,
+    },
+  });
+}
+
+async function streamToString(body: unknown): Promise<string> {
+  if (!body || typeof (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] !== 'function') return '';
+  const chunks: Buffer[] = [];
+  for await (const chunk of body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf-8');
 }
 
 async function startMemoryWebdav(): Promise<RunningWebdav> {
@@ -58,7 +108,7 @@ async function startMemoryWebdav(): Promise<RunningWebdav> {
     if (req.method === 'PROPFIND') {
       const data = files.get(pathname);
       if (!data && !collections.has(pathname)) return send(res, 404);
-      return send(res, 207, propfindXml(pathname, data), {
+      return send(res, 207, propfindXml(pathname, files, collections), {
         'content-type': 'application/xml',
       });
     }
@@ -103,6 +153,15 @@ function createTenant(endpoint: string): Tenant {
           region: REGION,
         },
       ],
+      [
+        'archive',
+        {
+          name: 'archive',
+          upstreamId: 'primary',
+          rootPath: '/archive',
+          region: REGION,
+        },
+      ],
     ]),
   };
 }
@@ -117,6 +176,27 @@ function createSessionTokenApp(endpoint: string): FastifyInstance {
   const registry = new TenantRegistry();
   registry.add({ ...createTenant(endpoint), sessionToken: SESSION_TOKEN });
   return buildApp({ tenantRegistry: registry, adminKey: 'test-admin-key' });
+}
+
+function runAwsCli(args: string[]): { stdout: string; stderr: string } {
+  const result = spawnSync('aws', args, {
+    encoding: 'utf-8',
+    shell: true,
+    env: {
+      ...process.env,
+      AWS_ACCESS_KEY_ID: ACCESS_KEY,
+      AWS_SECRET_ACCESS_KEY: SECRET_KEY,
+      AWS_DEFAULT_REGION: REGION,
+      AWS_EC2_METADATA_DISABLED: 'true',
+    },
+  });
+  if (result.status !== 0) {
+    throw new Error(`aws ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`);
+  }
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+  };
 }
 
 function signRequest(params: {
@@ -322,14 +402,31 @@ function quotedMd5(body: Buffer): string {
   return `"${createHash('md5').update(body).digest('hex')}"`;
 }
 
-function propfindXml(pathname: string, data?: Buffer): string {
-  const isCollection = data === undefined;
-  const length = data?.length ?? 0;
-  const etag = data ? quotedMd5(data) : '"collection"';
-  return `<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>${pathname}</d:href>
+function propfindXml(pathname: string, files: Map<string, Buffer>, collections: Set<string>): string {
+  const normalized = pathname.replace(/\/+$/, '') || '/';
+  const prefix = normalized === '/' ? '/' : `${normalized}/`;
+  const responsePaths = new Set<string>([normalized]);
+
+  for (const path of collections) {
+    const cleanPath = path.replace(/\/+$/, '') || '/';
+    if (cleanPath !== normalized && cleanPath.startsWith(prefix) && !cleanPath.slice(prefix.length).includes('/')) {
+      responsePaths.add(cleanPath);
+    }
+  }
+  for (const path of files.keys()) {
+    const cleanPath = path.replace(/\/+$/, '') || '/';
+    if (cleanPath !== normalized && cleanPath.startsWith(prefix) && !cleanPath.slice(prefix.length).includes('/')) {
+      responsePaths.add(cleanPath);
+    }
+  }
+
+  const responses = [...responsePaths].sort().map((path) => {
+    const data = files.get(path);
+    const isCollection = data === undefined;
+    const length = data?.length ?? 0;
+    const etag = data ? quotedMd5(data) : '"collection"';
+    return `  <d:response>
+    <d:href>${path}</d:href>
     <d:propstat>
       <d:prop>
         <d:getcontentlength>${length}</d:getcontentlength>
@@ -339,7 +436,12 @@ function propfindXml(pathname: string, data?: Buffer): string {
       </d:prop>
       <d:status>HTTP/1.1 200 OK</d:status>
     </d:propstat>
-  </d:response>
+  </d:response>`;
+  }).join('\n');
+
+  return `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+${responses}
 </d:multistatus>`;
 }
 
@@ -584,6 +686,653 @@ describe('S3 compatibility flows', () => {
     });
     expect(readResponse.statusCode).toBe(200);
     expect(readResponse.body).toBe('streaming-compatible-body');
+  });
+
+  it('preserves object metadata, checksums, tags, conditions, response overrides, and cross-bucket copy', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const pathname = '/uniid/object-semantics.txt';
+    const body = Buffer.from('object-semantics-body');
+    const checksum = createHash('sha256').update(body).digest('base64');
+    const contentMd5 = createHash('md5').update(body).digest('base64');
+    const putResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: body,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(body).digest('hex'),
+        extraHeaders: {
+          'content-length': String(body.length),
+          'content-md5': contentMd5,
+          'content-type': 'text/plain',
+          'cache-control': 'max-age=60',
+          'x-amz-checksum-sha256': checksum,
+          'x-amz-meta-owner': 'qa',
+          'x-amz-meta-purpose': 'object-semantics',
+          'x-amz-tagging': 'project=compat&stage=test',
+        },
+      }),
+    });
+    expect(putResponse.statusCode).toBe(200);
+    const etag = putResponse.headers.etag as string;
+    expect(etag).toBeTruthy();
+
+    const headResponse = await app.inject({
+      method: 'HEAD',
+      url: pathname,
+      headers: signRequest({ method: 'HEAD', pathname, host }),
+    });
+    expect(headResponse.statusCode).toBe(200);
+    expect(headResponse.headers['content-type']).toBe('text/plain');
+    expect(headResponse.headers['content-length']).toBe(String(body.length));
+    expect(headResponse.headers['x-amz-meta-owner']).toBe('qa');
+    expect(headResponse.headers['x-amz-meta-purpose']).toBe('object-semantics');
+    expect(headResponse.headers['x-amz-checksum-sha256']).toBe(checksum);
+
+    const notModifiedResponse = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({
+        method: 'GET',
+        pathname,
+        host,
+        extraHeaders: {
+          'if-none-match': etag,
+        },
+      }),
+    });
+    expect(notModifiedResponse.statusCode).toBe(304);
+
+    const preconditionFailedResponse = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({
+        method: 'GET',
+        pathname,
+        host,
+        extraHeaders: {
+          'if-match': '"missing-etag"',
+        },
+      }),
+    });
+    expect(preconditionFailedResponse.statusCode).toBe(412);
+
+    const overrideQuery = 'response-content-type=application%2Fjson&response-cache-control=no-cache';
+    const overrideResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?${overrideQuery}`,
+      headers: signRequest({ method: 'GET', pathname, queryString: overrideQuery, host }),
+    });
+    expect(overrideResponse.statusCode).toBe(200);
+    expect(overrideResponse.headers['content-type']).toBe('application/json');
+    expect(overrideResponse.headers['cache-control']).toBe('no-cache');
+    expect(overrideResponse.body).toBe('object-semantics-body');
+
+    const getTaggingResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?tagging=`,
+      headers: signRequest({ method: 'GET', pathname, queryString: 'tagging=', host }),
+    });
+    expect(getTaggingResponse.statusCode).toBe(200);
+    expect(getTaggingResponse.body).toContain('<Key>project</Key><Value>compat</Value>');
+    expect(getTaggingResponse.body).toContain('<Key>stage</Key><Value>test</Value>');
+
+    const replaceTaggingBody = Buffer.from('<Tagging><TagSet><Tag><Key>stage</Key><Value>copied</Value></Tag></TagSet></Tagging>');
+    const putTaggingResponse = await app.inject({
+      method: 'PUT',
+      url: `${pathname}?tagging=`,
+      payload: replaceTaggingBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        queryString: 'tagging=',
+        host,
+        payloadHash: createHash('sha256').update(replaceTaggingBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(replaceTaggingBody.length),
+        },
+      }),
+    });
+    expect(putTaggingResponse.statusCode).toBe(200);
+
+    const copyPathname = '/archive/copied-object.txt';
+    const copyResponse = await app.inject({
+      method: 'PUT',
+      url: copyPathname,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: copyPathname,
+        host,
+        extraHeaders: {
+          'x-amz-copy-source': '/uniid/object-semantics.txt',
+          'x-amz-copy-source-if-match': etag,
+          'x-amz-metadata-directive': 'REPLACE',
+          'x-amz-meta-owner': 'archive',
+          'x-amz-tagging-directive': 'REPLACE',
+          'x-amz-tagging': 'archive=yes',
+        },
+      }),
+    });
+    expect(copyResponse.statusCode).toBe(200);
+    expect(copyResponse.body).toContain('<CopyObjectResult');
+
+    const copiedHeadResponse = await app.inject({
+      method: 'HEAD',
+      url: copyPathname,
+      headers: signRequest({ method: 'HEAD', pathname: copyPathname, host }),
+    });
+    expect(copiedHeadResponse.statusCode).toBe(200);
+    expect(copiedHeadResponse.headers['x-amz-meta-owner']).toBe('archive');
+    expect(copiedHeadResponse.headers['x-amz-meta-purpose']).toBeUndefined();
+
+    const copiedTaggingResponse = await app.inject({
+      method: 'GET',
+      url: `${copyPathname}?tagging=`,
+      headers: signRequest({ method: 'GET', pathname: copyPathname, queryString: 'tagging=', host }),
+    });
+    expect(copiedTaggingResponse.statusCode).toBe(200);
+    expect(copiedTaggingResponse.body).toContain('<Key>archive</Key><Value>yes</Value>');
+  });
+
+  it('tracks object versions and delete markers when bucket versioning is enabled', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const versioningPath = '/uniid';
+    const versioningQuery = 'versioning=';
+    const versioningBody = Buffer.from('<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>');
+    const enableVersioningResponse = await app.inject({
+      method: 'PUT',
+      url: `${versioningPath}?${versioningQuery}`,
+      payload: versioningBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: versioningPath,
+        queryString: versioningQuery,
+        host,
+        payloadHash: createHash('sha256').update(versioningBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versioningBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(enableVersioningResponse.statusCode).toBe(200);
+
+    const pathname = '/uniid/versioned-object.txt';
+    const firstBody = Buffer.from('version-one');
+    const firstPutResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: firstBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(firstBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(firstBody.length),
+        },
+      }),
+    });
+    expect(firstPutResponse.statusCode).toBe(200);
+    const firstVersionId = firstPutResponse.headers['x-amz-version-id'] as string;
+    expect(firstVersionId).toBeTruthy();
+
+    const secondBody = Buffer.from('version-two');
+    const secondPutResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: secondBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(secondBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(secondBody.length),
+        },
+      }),
+    });
+    expect(secondPutResponse.statusCode).toBe(200);
+    const secondVersionId = secondPutResponse.headers['x-amz-version-id'] as string;
+    expect(secondVersionId).toBeTruthy();
+    expect(secondVersionId).not.toBe(firstVersionId);
+
+    const readFirstVersionQuery = `versionId=${encodeURIComponent(firstVersionId)}`;
+    const readFirstVersionResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?${readFirstVersionQuery}`,
+      headers: signRequest({ method: 'GET', pathname, queryString: readFirstVersionQuery, host }),
+    });
+    expect(readFirstVersionResponse.statusCode).toBe(200);
+    expect(readFirstVersionResponse.headers['x-amz-version-id']).toBe(firstVersionId);
+    expect(readFirstVersionResponse.body).toBe('version-one');
+
+    const deleteResponse = await app.inject({
+      method: 'DELETE',
+      url: pathname,
+      headers: signRequest({ method: 'DELETE', pathname, host }),
+    });
+    expect(deleteResponse.statusCode).toBe(204);
+    expect(deleteResponse.headers['x-amz-delete-marker']).toBe('true');
+    const deleteMarkerVersionId = deleteResponse.headers['x-amz-version-id'] as string;
+    expect(deleteMarkerVersionId).toBeTruthy();
+
+    const currentReadResponse = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(currentReadResponse.statusCode).toBe(404);
+
+    const listVersionsQuery = 'versions=';
+    const listVersionsResponse = await app.inject({
+      method: 'GET',
+      url: `${versioningPath}?${listVersionsQuery}`,
+      headers: signRequest({ method: 'GET', pathname: versioningPath, queryString: listVersionsQuery, host }),
+    });
+    expect(listVersionsResponse.statusCode).toBe(200);
+    expect(listVersionsResponse.body).toContain(`<VersionId>${firstVersionId}</VersionId>`);
+    expect(listVersionsResponse.body).toContain(`<VersionId>${secondVersionId}</VersionId>`);
+    expect(listVersionsResponse.body).toContain(`<VersionId>${deleteMarkerVersionId}</VersionId>`);
+    expect(listVersionsResponse.body).toContain('<DeleteMarker>');
+
+    const deleteSpecificVersionQuery = `versionId=${encodeURIComponent(firstVersionId)}`;
+    const deleteSpecificVersionResponse = await app.inject({
+      method: 'DELETE',
+      url: `${pathname}?${deleteSpecificVersionQuery}`,
+      headers: signRequest({ method: 'DELETE', pathname, queryString: deleteSpecificVersionQuery, host }),
+    });
+    expect(deleteSpecificVersionResponse.statusCode).toBe(204);
+    expect(deleteSpecificVersionResponse.headers['x-amz-version-id']).toBe(firstVersionId);
+
+    const readDeletedVersionResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?${readFirstVersionQuery}`,
+      headers: signRequest({ method: 'GET', pathname, queryString: readFirstVersionQuery, host }),
+    });
+    expect(readDeletedVersionResponse.statusCode).toBe(404);
+  });
+
+  it('blocks overwrite and delete when object legal hold or retention is active', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const pathname = '/uniid/locked-object.txt';
+    const body = Buffer.from('locked-body');
+    const putResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: body,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(body).digest('hex'),
+        extraHeaders: {
+          'content-length': String(body.length),
+        },
+      }),
+    });
+    expect(putResponse.statusCode).toBe(200);
+
+    const legalHoldQuery = 'legal-hold=';
+    const legalHoldBody = Buffer.from('<LegalHold><Status>ON</Status></LegalHold>');
+    const legalHoldResponse = await app.inject({
+      method: 'PUT',
+      url: `${pathname}?${legalHoldQuery}`,
+      payload: legalHoldBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        queryString: legalHoldQuery,
+        host,
+        payloadHash: createHash('sha256').update(legalHoldBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(legalHoldBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(legalHoldResponse.statusCode).toBe(200);
+
+    const getLegalHoldResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?${legalHoldQuery}`,
+      headers: signRequest({ method: 'GET', pathname, queryString: legalHoldQuery, host }),
+    });
+    expect(getLegalHoldResponse.statusCode).toBe(200);
+    expect(getLegalHoldResponse.body).toContain('<Status>ON</Status>');
+
+    const overwriteResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: Buffer.from('new-body'),
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update('new-body').digest('hex'),
+        extraHeaders: {
+          'content-length': String(Buffer.byteLength('new-body')),
+        },
+      }),
+    });
+    expect(overwriteResponse.statusCode).toBe(403);
+
+    const deleteResponse = await app.inject({
+      method: 'DELETE',
+      url: pathname,
+      headers: signRequest({ method: 'DELETE', pathname, host }),
+    });
+    expect(deleteResponse.statusCode).toBe(403);
+
+    const releaseLegalHoldBody = Buffer.from('<LegalHold><Status>OFF</Status></LegalHold>');
+    const releaseLegalHoldResponse = await app.inject({
+      method: 'PUT',
+      url: `${pathname}?${legalHoldQuery}`,
+      payload: releaseLegalHoldBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        queryString: legalHoldQuery,
+        host,
+        payloadHash: createHash('sha256').update(releaseLegalHoldBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(releaseLegalHoldBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(releaseLegalHoldResponse.statusCode).toBe(200);
+
+    const retentionQuery = 'retention=';
+    const retainUntilDate = new Date(Date.now() + 60_000).toISOString();
+    const retentionBody = Buffer.from(`<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>${retainUntilDate}</RetainUntilDate></Retention>`);
+    const retentionResponse = await app.inject({
+      method: 'PUT',
+      url: `${pathname}?${retentionQuery}`,
+      payload: retentionBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        queryString: retentionQuery,
+        host,
+        payloadHash: createHash('sha256').update(retentionBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(retentionBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(retentionResponse.statusCode).toBe(200);
+
+    const getRetentionResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?${retentionQuery}`,
+      headers: signRequest({ method: 'GET', pathname, queryString: retentionQuery, host }),
+    });
+    expect(getRetentionResponse.statusCode).toBe(200);
+    expect(getRetentionResponse.body).toContain('<Mode>GOVERNANCE</Mode>');
+
+    const retentionDeleteResponse = await app.inject({
+      method: 'DELETE',
+      url: pathname,
+      headers: signRequest({ method: 'DELETE', pathname, host }),
+    });
+    expect(retentionDeleteResponse.statusCode).toBe(403);
+  });
+
+  it('expires noncurrent versions through lifecycle scans', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+
+    const registry = new TenantRegistry();
+    registry.add(createTenant(webdav.endpoint));
+
+    const host = '127.0.0.1';
+    const versioningPath = '/uniid';
+    const versioningQuery = 'versioning=';
+    const versioningBody = Buffer.from('<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>');
+    const enableVersioningResponse = await app.inject({
+      method: 'PUT',
+      url: `${versioningPath}?${versioningQuery}`,
+      payload: versioningBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: versioningPath,
+        queryString: versioningQuery,
+        host,
+        payloadHash: createHash('sha256').update(versioningBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versioningBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(enableVersioningResponse.statusCode).toBe(200);
+
+    const pathname = '/uniid/lifecycle-object.txt';
+    const firstBody = Buffer.from('lifecycle-one');
+    const firstPutResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: firstBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(firstBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(firstBody.length),
+        },
+      }),
+    });
+    expect(firstPutResponse.statusCode).toBe(200);
+    const firstVersionId = firstPutResponse.headers['x-amz-version-id'] as string;
+    expect(firstVersionId).toBeTruthy();
+
+    const secondBody = Buffer.from('lifecycle-two');
+    const secondPutResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: secondBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(secondBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(secondBody.length),
+        },
+      }),
+    });
+    expect(secondPutResponse.statusCode).toBe(200);
+
+    const result = await runLifecycleOnce(registry, {
+      enabled: true,
+      intervalMs: 1000,
+      expireNoncurrentVersionsAfterMs: 0,
+    });
+    expect(result.scannedBuckets).toBeGreaterThan(0);
+    expect(result.removedVersions).toBeGreaterThan(0);
+
+    const readExpiredVersionQuery = `versionId=${encodeURIComponent(firstVersionId)}`;
+    const readExpiredVersionResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?${readExpiredVersionQuery}`,
+      headers: signRequest({ method: 'GET', pathname, queryString: readExpiredVersionQuery, host }),
+    });
+    expect(readExpiredVersionResponse.statusCode).toBe(404);
+  });
+
+  it('runs common AWS SDK S3 commands against a real local endpoint', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+    const running = await startS3App(app);
+    const client = createAwsSdkClient(running.endpoint);
+
+    const key = 'sdk/basic-object.txt';
+    await client.send(new PutObjectCommand({
+      Bucket: 'uniid',
+      Key: key,
+      Body: Buffer.from('sdk-basic-body'),
+      ContentType: 'text/plain',
+      Metadata: {
+        source: 'aws-sdk',
+      },
+      Tagging: 'suite=compat',
+    }));
+
+    const head = await client.send(new HeadObjectCommand({ Bucket: 'uniid', Key: key }));
+    expect(head.ContentType).toBe('text/plain');
+    expect(head.Metadata?.source).toBe('aws-sdk');
+
+    const get = await client.send(new GetObjectCommand({ Bucket: 'uniid', Key: key }));
+    expect(await streamToString(get.Body)).toBe('sdk-basic-body');
+
+    const list = await client.send(new ListObjectsV2Command({ Bucket: 'uniid', Prefix: 'sdk/' }));
+    expect(list.Contents?.some((item) => item.Key === key)).toBe(true);
+
+    await client.send(new DeleteObjectCommand({ Bucket: 'uniid', Key: key }));
+    await expect(client.send(new GetObjectCommand({ Bucket: 'uniid', Key: key }))).rejects.toMatchObject({ name: 'NoSuchKey' });
+
+    running.close = () => Promise.resolve();
+    client.destroy();
+  });
+
+  it('accepts browser-style presigned PUT and GET against a real local endpoint', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+    const running = await startS3App(app);
+    const endpoint = new URL(running.endpoint);
+    const host = endpoint.host;
+    const key = 'sdk/presigned-roundtrip.txt';
+    const pathname = `/uniid/${key}`;
+    const body = 'presigned-real-endpoint-body';
+
+    const putQuery = createPresignedQuery({
+      method: 'PUT',
+      pathname,
+      host,
+      extraQuery: 'x-id=PutObject',
+    });
+    const putResponse = await fetch(`${running.endpoint}${pathname}?${putQuery}`, {
+      method: 'PUT',
+      body,
+      headers: {
+        'content-type': 'text/plain',
+      },
+    });
+    expect(putResponse.status).toBe(200);
+
+    const getQuery = createPresignedQuery({
+      method: 'GET',
+      pathname,
+      host,
+      extraQuery: 'x-id=GetObject',
+    });
+    const getResponse = await fetch(`${running.endpoint}${pathname}?${getQuery}`);
+    expect(getResponse.status).toBe(200);
+    expect(getResponse.headers.get('content-type')).toBe('text/plain');
+    expect(await getResponse.text()).toBe(body);
+
+    running.close = () => Promise.resolve();
+  });
+
+  it.runIf(AWS_CLI_AVAILABLE)('runs AWS CLI s3 cp, ls, and rm against a real local endpoint', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+    const running = await startS3App(app);
+    const workdir = await mkdtemp(join(tmpdir(), 'webdavtos3-aws-cli-'));
+    const sourcePath = join(workdir, 'source.txt');
+    const downloadPath = join(workdir, 'download.txt');
+    const key = 'cli/roundtrip.txt';
+
+    try {
+      await writeFile(sourcePath, 'aws-cli-roundtrip-body');
+      runAwsCli(['s3', 'cp', sourcePath, `s3://uniid/${key}`, '--endpoint-url', running.endpoint]);
+      const list = runAwsCli(['s3', 'ls', 's3://uniid/cli/', '--endpoint-url', running.endpoint]);
+      expect(list.stdout).toContain('roundtrip.txt');
+
+      runAwsCli(['s3', 'cp', `s3://uniid/${key}`, downloadPath, '--endpoint-url', running.endpoint]);
+      expect(await readFile(downloadPath, 'utf-8')).toBe('aws-cli-roundtrip-body');
+
+      runAwsCli(['s3', 'rm', `s3://uniid/${key}`, '--endpoint-url', running.endpoint]);
+      const afterRemove = runAwsCli(['s3', 'ls', 's3://uniid/cli/', '--endpoint-url', running.endpoint]);
+      expect(afterRemove.stdout).not.toContain('roundtrip.txt');
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+      running.close = () => Promise.resolve();
+    }
+  });
+
+  it('runs AWS SDK multipart upload commands against a real local endpoint', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+    const running = await startS3App(app);
+    const client = createAwsSdkClient(running.endpoint);
+
+    const key = 'sdk/multipart-object.txt';
+    const create = await client.send(new CreateMultipartUploadCommand({ Bucket: 'uniid', Key: key }));
+    expect(create.UploadId).toBeTruthy();
+
+    const partOne = await client.send(new UploadPartCommand({
+      Bucket: 'uniid',
+      Key: key,
+      UploadId: create.UploadId,
+      PartNumber: 1,
+      Body: Buffer.from('sdk-multipart-'),
+    }));
+    const partTwo = await client.send(new UploadPartCommand({
+      Bucket: 'uniid',
+      Key: key,
+      UploadId: create.UploadId,
+      PartNumber: 2,
+      Body: Buffer.from('body'),
+    }));
+
+    await client.send(new CompleteMultipartUploadCommand({
+      Bucket: 'uniid',
+      Key: key,
+      UploadId: create.UploadId,
+      MultipartUpload: {
+        Parts: [
+          { ETag: partOne.ETag, PartNumber: 1 },
+          { ETag: partTwo.ETag, PartNumber: 2 },
+        ],
+      },
+    }));
+
+    const get = await client.send(new GetObjectCommand({ Bucket: 'uniid', Key: key }));
+    expect(await streamToString(get.Body)).toBe('sdk-multipart-body');
+
+    running.close = () => Promise.resolve();
+    client.destroy();
   });
 
   it('accepts browser POST policy uploads', async () => {
