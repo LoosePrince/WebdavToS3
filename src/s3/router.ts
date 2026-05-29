@@ -124,31 +124,31 @@ export async function handleS3Request(
       case 'GetBucketCors':
         return await handleGetXmlControl(ctx, 'cors', corsXml());
       case 'PutBucketCors':
-        return await handlePutJsonControl(ctx, 'cors');
+        return await handlePutXmlControl(ctx, 'cors');
       case 'DeleteBucketCors':
         return await handleDeleteJsonControl(ctx, 'cors');
       case 'GetBucketTagging':
         return await handleGetBucketTagging(ctx);
       case 'PutBucketTagging':
-        return await handlePutJsonControl(ctx, 'tagging');
+        return await handlePutBucketTagging(ctx);
       case 'DeleteBucketTagging':
         return await handleDeleteJsonControl(ctx, 'tagging');
       case 'GetBucketLifecycle':
         return await handleGetXmlControl(ctx, 'lifecycle', lifecycleXml());
       case 'PutBucketLifecycle':
-        return await handlePutJsonControl(ctx, 'lifecycle');
+        return await handlePutXmlControl(ctx, 'lifecycle');
       case 'DeleteBucketLifecycle':
         return await handleDeleteJsonControl(ctx, 'lifecycle');
       case 'GetBucketEncryption':
         return await handleGetXmlControl(ctx, 'encryption', encryptionXml());
       case 'PutBucketEncryption':
-        return await handlePutJsonControl(ctx, 'encryption');
+        return await handlePutXmlControl(ctx, 'encryption');
       case 'DeleteBucketEncryption':
         return await handleDeleteJsonControl(ctx, 'encryption');
       case 'GetPublicAccessBlock':
         return await handleGetXmlControl(ctx, 'publicAccessBlock', publicAccessBlockXml());
       case 'PutPublicAccessBlock':
-        return await handlePutJsonControl(ctx, 'publicAccessBlock');
+        return await handlePutXmlControl(ctx, 'publicAccessBlock');
       case 'DeletePublicAccessBlock':
         return await handleDeleteJsonControl(ctx, 'publicAccessBlock');
       case 'CreateMultipartUpload':
@@ -162,9 +162,9 @@ export async function handleS3Request(
       case 'ListParts':
         return await handleListParts(ctx);
       case 'ListMultipartUploads':
-        return sendXml(ctx, 200, multipartUploadsXml(ctx.bucket.name));
+        return sendXml(ctx, 200, multipartUploadsXml(ctx.bucket.name, await ctx.state!.listMultipartUploads(ctx.bucketName!)));
       case 'DeleteObjects':
-        return sendXml(ctx, 200, '<?xml version="1.0" encoding="UTF-8"?>\n<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>');
+        return await handleDeleteObjects(ctx);
       case 'GetObjectTagging':
         return await handleGetObjectTagging(ctx);
       case 'PutObjectTagging':
@@ -427,6 +427,52 @@ async function handleDeleteObject(ctx: S3RequestContext) {
   return ctx.reply.status(204).header('x-amz-request-id', ctx.requestId).send();
 }
 
+async function handleDeleteObjects(ctx: S3RequestContext) {
+  const keys = parseDeleteObjectsBody(await requestBodyText(ctx.req.body));
+  const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
+  const deleted: Array<{ key: string; versionId?: string; deleteMarker?: boolean }> = [];
+  const errors: Array<{ key: string; code: string; message: string }> = [];
+
+  for (const key of keys) {
+    const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, key);
+    if (isObjectLocked(existing)) {
+      errors.push({ key, code: 'AccessDenied', message: 'Object is protected by Object Lock' });
+      continue;
+    }
+
+    if (bucketState.versioning === 'Enabled') {
+      const deleteMarkerVersionId = createVersionId(ctx.bucketName!, `${key}:delete`);
+      const marker: ObjectVersionState = {
+        bucket: ctx.bucketName!,
+        key,
+        etag: '',
+        size: 0,
+        lastModified: new Date().toISOString(),
+        contentType: 'application/octet-stream',
+        userMetadata: {},
+        tagging: {},
+        versionId: deleteMarkerVersionId,
+        isLatest: true,
+        isDeleteMarker: true,
+      };
+      await ctx.state!.putObjectMetadata(marker);
+      await ctx.state!.putObjectVersion(marker);
+      deleted.push({ key, versionId: deleteMarkerVersionId, deleteMarker: true });
+      continue;
+    }
+
+    try {
+      await deleteObject(ctx.client!, ctx.bucket!, key);
+      await ctx.state!.deleteObjectMetadata(ctx.bucketName!, key);
+      deleted.push({ key });
+    } catch (err) {
+      errors.push({ key, code: 'InternalError', message: String(err) });
+    }
+  }
+
+  return sendXml(ctx, 200, deleteObjectsXml(deleted, errors));
+}
+
 async function handleCopyObject(ctx: S3RequestContext) {
   const sourceHeader = ctx.headers['x-amz-copy-source'];
   if (!sourceHeader) return sendS3Error(ctx.reply, 'InvalidRequest', 'Missing x-amz-copy-source header', 400, ctx.requestId);
@@ -560,6 +606,13 @@ async function handlePutJsonControl(ctx: S3RequestContext, key: keyof BucketStat
   return sendEmpty(ctx, 200);
 }
 
+async function handlePutXmlControl(ctx: S3RequestContext, key: keyof BucketState) {
+  const state = await ctx.state!.getBucketState(ctx.bucketName!);
+  (state as unknown as Record<string, unknown>)[key] = await requestBodyText(ctx.req.body);
+  await ctx.state!.putBucketState(state);
+  return sendEmpty(ctx, 200);
+}
+
 async function handleDeleteJsonControl(ctx: S3RequestContext, key: keyof BucketState) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
   delete (state as unknown as Record<string, unknown>)[key];
@@ -569,13 +622,21 @@ async function handleDeleteJsonControl(ctx: S3RequestContext, key: keyof BucketS
 
 async function handleGetXmlControl(ctx: S3RequestContext, key: keyof BucketState, fallbackXml: string) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
-  if (state[key] === undefined) return sendXml(ctx, 200, fallbackXml);
+  const value = state[key];
+  if (typeof value === 'string' && value.trim()) return sendXml(ctx, 200, value);
   return sendXml(ctx, 200, fallbackXml);
 }
 
 async function handleGetBucketTagging(ctx: S3RequestContext) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
   return sendXml(ctx, 200, taggingXml(state.tagging ?? {}));
+}
+
+async function handlePutBucketTagging(ctx: S3RequestContext) {
+  const state = await ctx.state!.getBucketState(ctx.bucketName!);
+  state.tagging = parseTaggingXml(await requestBodyText(ctx.req.body));
+  await ctx.state!.putBucketState(state);
+  return sendEmpty(ctx, 200);
 }
 
 async function handleGetObjectTagging(ctx: S3RequestContext) {
@@ -1043,6 +1104,37 @@ function parseCompleteMultipartBody(xml: string): number[] {
   return [...xml.matchAll(/<PartNumber>(\d+)<\/PartNumber>/g)].map((match) => Number(match[1]));
 }
 
+function parseDeleteObjectsBody(xml: string): string[] {
+  return [...xml.matchAll(/<Object>[\s\S]*?<Key>([\s\S]*?)<\/Key>[\s\S]*?<\/Object>/g)]
+    .map((match) => unescapeXml(match[1] ?? ''))
+    .filter((key) => key.length > 0);
+}
+
+function deleteObjectsXml(
+  deleted: Array<{ key: string; versionId?: string; deleteMarker?: boolean }>,
+  errors: Array<{ key: string; code: string; message: string }>,
+): string {
+  const deletedXml = deleted.map((item) => [
+    '  <Deleted>',
+    `    <Key>${escapeXml(item.key)}</Key>`,
+    item.versionId ? `    <VersionId>${escapeXml(item.versionId)}</VersionId>` : '',
+    item.deleteMarker ? '    <DeleteMarker>true</DeleteMarker>' : '',
+    '  </Deleted>',
+  ].filter(Boolean).join('\n')).join('\n');
+  const errorsXml = errors.map((item) => [
+    '  <Error>',
+    `    <Key>${escapeXml(item.key)}</Key>`,
+    `    <Code>${escapeXml(item.code)}</Code>`,
+    `    <Message>${escapeXml(item.message)}</Message>`,
+    '  </Error>',
+  ].join('\n')).join('\n');
+  const body = [deletedXml, errorsXml].filter(Boolean).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+${body}
+</DeleteResult>`;
+}
+
 function createWeakEtag(body: Buffer): string {
   let hash = 0;
   for (const byte of body) hash = ((hash << 5) - hash + byte) | 0;
@@ -1093,11 +1185,18 @@ ${parts}
 </ListPartsResult>`;
 }
 
-function multipartUploadsXml(bucket: string): string {
+function multipartUploadsXml(bucket: string, uploads: MultipartUploadState[] = []): string {
+  const uploadsXml = uploads.map((upload) => `  <Upload>
+    <Key>${escapeXml(upload.key)}</Key>
+    <UploadId>${escapeXml(upload.uploadId)}</UploadId>
+    <StorageClass>STANDARD</StorageClass>
+    <Initiated>${new Date(upload.initiatedAt).toISOString()}</Initiated>
+  </Upload>`).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Bucket>${escapeXml(bucket)}</Bucket>
   <IsTruncated>false</IsTruncated>
+${uploadsXml}
 </ListMultipartUploadsResult>`;
 }
 

@@ -108,6 +108,19 @@ export class S3StateStore {
     return this.readJson<MultipartUploadState>(this.multipartStatePath(bucket, uploadId));
   }
 
+  async listMultipartUploads(bucket: string): Promise<MultipartUploadState[]> {
+    const root = `${SYSTEM_ROOT}/buckets/${encodeURIComponent(bucket)}/multipart`;
+    const entries = await this.client.list(root);
+    const rootPath = root.replace(/\/+$/, '');
+    const uploadIds = [...new Set(entries
+      .map((entry) => decodeURIComponent(entry.href).replace(/\/+$/, ''))
+      .filter((href) => href !== rootPath)
+      .map((href) => href.slice(href.lastIndexOf('/') + 1))
+      .filter((uploadId) => uploadId.length > 0 && uploadId !== 'upload.json' && uploadId !== 'parts'))];
+    const uploads = await Promise.all(uploadIds.map((uploadId) => this.getMultipartUpload(bucket, uploadId)));
+    return uploads.filter((upload): upload is MultipartUploadState => upload !== null);
+  }
+
   async putMultipartUpload(state: MultipartUploadState): Promise<void> {
     await this.writeJson(this.multipartStatePath(state.bucket, state.uploadId), state);
   }

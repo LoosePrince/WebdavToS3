@@ -359,6 +359,12 @@ function normalizeHeaderValue(value: string): string {
   return value.trim().replace(/\s+/g, ' ');
 }
 
+function compareCanonicalComponent(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
 function buildCanonicalQueryString(queryString: string, excludedKeys = new Set<string>()): string {
   if (!queryString) return '';
 
@@ -377,7 +383,7 @@ function buildCanonicalQueryString(queryString: string, excludedKeys = new Set<s
   }
 
   return pairs
-    .sort((a, b) => (a.key === b.key ? a.value.localeCompare(b.value) : a.key.localeCompare(b.key)))
+    .sort((a, b) => (a.key === b.key ? compareCanonicalComponent(a.value, b.value) : compareCanonicalComponent(a.key, b.key)))
     .map(({ key, value }) => `${key}=${value}`)
     .join('&');
 }

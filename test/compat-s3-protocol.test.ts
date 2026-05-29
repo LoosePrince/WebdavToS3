@@ -8,16 +8,58 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net';
 import type { FastifyInstance } from 'fastify';
 import {
+  AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
+  CopyObjectCommand,
+  CreateBucketCommand,
   CreateMultipartUploadCommand,
+  DeleteBucketCommand,
+  DeleteBucketCorsCommand,
+  DeleteBucketEncryptionCommand,
+  DeleteBucketLifecycleCommand,
+  DeleteBucketPolicyCommand,
+  DeleteBucketTaggingCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
+  DeleteObjectTaggingCommand,
+  DeletePublicAccessBlockCommand,
+  GetBucketAclCommand,
+  GetBucketCorsCommand,
+  GetBucketEncryptionCommand,
+  GetBucketLifecycleConfigurationCommand,
+  GetBucketLocationCommand,
+  GetBucketPolicyCommand,
+  GetBucketTaggingCommand,
+  GetBucketVersioningCommand,
   GetObjectCommand,
+  GetObjectLegalHoldCommand,
+  GetObjectRetentionCommand,
+  GetObjectTaggingCommand,
+  GetPublicAccessBlockCommand,
+  HeadBucketCommand,
   HeadObjectCommand,
+  ListBucketsCommand,
+  ListMultipartUploadsCommand,
+  ListObjectsCommand,
   ListObjectsV2Command,
+  ListObjectVersionsCommand,
+  ListPartsCommand,
+  PutBucketAclCommand,
+  PutBucketCorsCommand,
+  PutBucketEncryptionCommand,
+  PutBucketLifecycleConfigurationCommand,
+  PutBucketPolicyCommand,
+  PutBucketTaggingCommand,
+  PutBucketVersioningCommand,
   PutObjectCommand,
+  PutObjectLegalHoldCommand,
+  PutObjectRetentionCommand,
+  PutObjectTaggingCommand,
+  PutPublicAccessBlockCommand,
   S3Client,
   UploadPartCommand,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { buildApp } from '../src/http/app.js';
 import { TenantRegistry, type Tenant } from '../src/tenancy/tenant-registry.js';
 import { runLifecycleOnce } from '../src/s3/lifecycle/worker.js';
@@ -337,6 +379,12 @@ function awsChunkedBody(data: Buffer): Buffer {
   ]);
 }
 
+function compareCanonicalComponent(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
 function buildCanonicalQueryString(queryString: string): string {
   if (!queryString) return '';
   return queryString
@@ -351,7 +399,7 @@ function buildCanonicalQueryString(queryString: string): string {
         value: encodeRfc3986(decodeQueryComponent(rawValue)),
       };
     })
-    .sort((a, b) => (a.key === b.key ? a.value.localeCompare(b.value) : a.key.localeCompare(b.key)))
+    .sort((a, b) => (a.key === b.key ? compareCanonicalComponent(a.value, b.value) : compareCanonicalComponent(a.key, b.key)))
     .map(({ key, value }) => `${key}=${value}`)
     .join('&');
 }
@@ -1330,6 +1378,214 @@ describe('S3 compatibility flows', () => {
 
     const get = await client.send(new GetObjectCommand({ Bucket: 'uniid', Key: key }));
     expect(await streamToString(get.Body)).toBe('sdk-multipart-body');
+
+    running.close = () => Promise.resolve();
+    client.destroy();
+  });
+
+  it('runs every implemented S3 operation through official AWS SDK packages', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const app = createApp(webdav.endpoint);
+    apps.push(app);
+    const running = await startS3App(app);
+    const client = createAwsSdkClient(running.endpoint);
+    const bucket = 'uniid';
+
+    const buckets = await client.send(new ListBucketsCommand({}));
+    expect(buckets.Buckets?.map((item) => item.Name)).toContain(bucket);
+    await client.send(new HeadBucketCommand({ Bucket: bucket }));
+    await client.send(new CreateBucketCommand({ Bucket: bucket }));
+    await expect(client.send(new DeleteBucketCommand({ Bucket: bucket }))).rejects.toMatchObject({ name: 'BucketNotEmpty' });
+
+    const location = await client.send(new GetBucketLocationCommand({ Bucket: bucket }));
+    expect([REGION, undefined]).toContain(location.LocationConstraint);
+
+    await client.send(new PutBucketAclCommand({ Bucket: bucket, ACL: 'private' }));
+    const acl = await client.send(new GetBucketAclCommand({ Bucket: bucket }));
+    expect(acl.Owner?.ID).toBe('webdavtos3');
+
+    await client.send(new PutBucketPolicyCommand({
+      Bucket: bucket,
+      Policy: JSON.stringify({
+        Version: '2012-10-17',
+        Statement: [{ Effect: 'Allow', Principal: '*', Action: 's3:GetObject', Resource: `arn:aws:s3:::${bucket}/*` }],
+      }),
+    }));
+    const policy = await client.send(new GetBucketPolicyCommand({ Bucket: bucket }));
+    expect(policy.Policy).toContain('2012-10-17');
+    await client.send(new DeleteBucketPolicyCommand({ Bucket: bucket }));
+    await expect(client.send(new GetBucketPolicyCommand({ Bucket: bucket }))).rejects.toMatchObject({ name: 'NoSuchConfiguration' });
+
+    await client.send(new PutBucketCorsCommand({
+      Bucket: bucket,
+      CORSConfiguration: {
+        CORSRules: [{
+          ID: 'sdk-cors',
+          AllowedMethods: ['GET', 'PUT'],
+          AllowedOrigins: ['*'],
+          AllowedHeaders: ['*'],
+          ExposeHeaders: ['etag'],
+          MaxAgeSeconds: 60,
+        }],
+      },
+    }));
+    const cors = await client.send(new GetBucketCorsCommand({ Bucket: bucket }));
+    expect(cors.CORSRules?.[0]?.AllowedMethods).toEqual(expect.arrayContaining(['GET', 'PUT']));
+    await client.send(new DeleteBucketCorsCommand({ Bucket: bucket }));
+
+    await client.send(new PutBucketTaggingCommand({
+      Bucket: bucket,
+      Tagging: { TagSet: [{ Key: 'suite', Value: 'aws-sdk' }] },
+    }));
+    const bucketTagging = await client.send(new GetBucketTaggingCommand({ Bucket: bucket }));
+    expect(bucketTagging.TagSet).toContainEqual({ Key: 'suite', Value: 'aws-sdk' });
+    await client.send(new DeleteBucketTaggingCommand({ Bucket: bucket }));
+    const emptyBucketTagging = await client.send(new GetBucketTaggingCommand({ Bucket: bucket }));
+    expect(emptyBucketTagging.TagSet ?? []).toHaveLength(0);
+
+    await client.send(new PutBucketLifecycleConfigurationCommand({
+      Bucket: bucket,
+      LifecycleConfiguration: {
+        Rules: [{
+          ID: 'expire-temp',
+          Status: 'Enabled',
+          Filter: { Prefix: 'tmp/' },
+          Expiration: { Days: 1 },
+        }],
+      },
+    }));
+    const lifecycle = await client.send(new GetBucketLifecycleConfigurationCommand({ Bucket: bucket }));
+    expect(lifecycle.Rules?.[0]?.ID).toBe('expire-temp');
+    await client.send(new DeleteBucketLifecycleCommand({ Bucket: bucket }));
+
+    await client.send(new PutBucketEncryptionCommand({
+      Bucket: bucket,
+      ServerSideEncryptionConfiguration: {
+        Rules: [{ ApplyServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } }],
+      },
+    }));
+    const encryption = await client.send(new GetBucketEncryptionCommand({ Bucket: bucket }));
+    expect(encryption.ServerSideEncryptionConfiguration?.Rules?.[0]?.ApplyServerSideEncryptionByDefault?.SSEAlgorithm).toBe('AES256');
+    await client.send(new DeleteBucketEncryptionCommand({ Bucket: bucket }));
+
+    await client.send(new PutPublicAccessBlockCommand({
+      Bucket: bucket,
+      PublicAccessBlockConfiguration: {
+        BlockPublicAcls: true,
+        IgnorePublicAcls: true,
+        BlockPublicPolicy: true,
+        RestrictPublicBuckets: true,
+      },
+    }));
+    const publicAccessBlock = await client.send(new GetPublicAccessBlockCommand({ Bucket: bucket }));
+    expect(publicAccessBlock.PublicAccessBlockConfiguration?.BlockPublicAcls).toBe(true);
+    await client.send(new DeletePublicAccessBlockCommand({ Bucket: bucket }));
+
+    const baseKey = 'sdk/all/base.txt';
+    await client.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: baseKey,
+      Body: Buffer.from('all-ops-body'),
+      ContentType: 'text/plain',
+      Metadata: { suite: 'all-ops' },
+      Tagging: 'phase=initial',
+    }));
+    const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: baseKey }));
+    expect(head.ContentType).toBe('text/plain');
+    expect(head.Metadata?.suite).toBe('all-ops');
+    const get = await client.send(new GetObjectCommand({ Bucket: bucket, Key: baseKey }));
+    expect(await streamToString(get.Body)).toBe('all-ops-body');
+
+    const listV1 = await client.send(new ListObjectsCommand({ Bucket: bucket, Prefix: 'sdk/all/' }));
+    expect(listV1.Contents?.some((item) => item.Key === baseKey)).toBe(true);
+    const listV2 = await client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: 'sdk/all/' }));
+    expect(listV2.Contents?.some((item) => item.Key === baseKey)).toBe(true);
+
+    await client.send(new PutObjectTaggingCommand({
+      Bucket: bucket,
+      Key: baseKey,
+      Tagging: { TagSet: [{ Key: 'phase', Value: 'updated' }] },
+    }));
+    const objectTags = await client.send(new GetObjectTaggingCommand({ Bucket: bucket, Key: baseKey }));
+    expect(objectTags.TagSet).toContainEqual({ Key: 'phase', Value: 'updated' });
+    await client.send(new DeleteObjectTaggingCommand({ Bucket: bucket, Key: baseKey }));
+    const emptyObjectTags = await client.send(new GetObjectTaggingCommand({ Bucket: bucket, Key: baseKey }));
+    expect(emptyObjectTags.TagSet ?? []).toHaveLength(0);
+
+    const copyKey = 'sdk/all/copied.txt';
+    await client.send(new CopyObjectCommand({ Bucket: 'archive', Key: copyKey, CopySource: `/${bucket}/${baseKey}` }));
+    const copied = await client.send(new GetObjectCommand({ Bucket: 'archive', Key: copyKey }));
+    expect(await streamToString(copied.Body)).toBe('all-ops-body');
+
+    const lockedKey = 'sdk/all/locked.txt';
+    await client.send(new PutObjectCommand({ Bucket: bucket, Key: lockedKey, Body: Buffer.from('locked') }));
+    await client.send(new PutObjectLegalHoldCommand({ Bucket: bucket, Key: lockedKey, LegalHold: { Status: 'ON' } }));
+    const legalHold = await client.send(new GetObjectLegalHoldCommand({ Bucket: bucket, Key: lockedKey }));
+    expect(legalHold.LegalHold?.Status).toBe('ON');
+    await expect(client.send(new PutObjectCommand({ Bucket: bucket, Key: lockedKey, Body: Buffer.from('blocked') }))).rejects.toMatchObject({ name: 'AccessDenied' });
+    await client.send(new PutObjectLegalHoldCommand({ Bucket: bucket, Key: lockedKey, LegalHold: { Status: 'OFF' } }));
+    const retainUntilDate = new Date(Date.now() + 60_000);
+    await client.send(new PutObjectRetentionCommand({ Bucket: bucket, Key: lockedKey, Retention: { Mode: 'GOVERNANCE', RetainUntilDate: retainUntilDate } }));
+    const retention = await client.send(new GetObjectRetentionCommand({ Bucket: bucket, Key: lockedKey }));
+    expect(retention.Retention?.Mode).toBe('GOVERNANCE');
+    await expect(client.send(new DeleteObjectCommand({ Bucket: bucket, Key: lockedKey }))).rejects.toMatchObject({ name: 'AccessDenied' });
+
+    await client.send(new PutBucketVersioningCommand({ Bucket: bucket, VersioningConfiguration: { Status: 'Enabled' } }));
+    const versioning = await client.send(new GetBucketVersioningCommand({ Bucket: bucket }));
+    expect(versioning.Status).toBe('Enabled');
+    const versionedKey = 'sdk/all/versioned.txt';
+    const versionOne = await client.send(new PutObjectCommand({ Bucket: bucket, Key: versionedKey, Body: Buffer.from('v1') }));
+    const versionTwo = await client.send(new PutObjectCommand({ Bucket: bucket, Key: versionedKey, Body: Buffer.from('v2') }));
+    expect(versionOne.VersionId).toBeTruthy();
+    expect(versionTwo.VersionId).toBeTruthy();
+    const oldVersion = await client.send(new GetObjectCommand({ Bucket: bucket, Key: versionedKey, VersionId: versionOne.VersionId }));
+    expect(await streamToString(oldVersion.Body)).toBe('v1');
+    await client.send(new HeadObjectCommand({ Bucket: bucket, Key: versionedKey, VersionId: versionTwo.VersionId }));
+    const versions = await client.send(new ListObjectVersionsCommand({ Bucket: bucket, Prefix: versionedKey }));
+    expect(versions.Versions?.length).toBeGreaterThanOrEqual(2);
+    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: versionedKey, VersionId: versionOne.VersionId }));
+    await expect(client.send(new GetObjectCommand({ Bucket: bucket, Key: versionedKey, VersionId: versionOne.VersionId }))).rejects.toMatchObject({ name: 'NoSuchVersion' });
+    await client.send(new PutBucketVersioningCommand({ Bucket: bucket, VersioningConfiguration: { Status: 'Suspended' } }));
+
+    const deleteManyKeys = ['sdk/all/delete-many-a.txt', 'sdk/all/delete-many-b.txt'];
+    await Promise.all(deleteManyKeys.map((key) => client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: Buffer.from(key) }))));
+    const deleteManyResult = await client.send(new DeleteObjectsCommand({
+      Bucket: bucket,
+      Delete: { Objects: deleteManyKeys.map((Key) => ({ Key })) },
+    }));
+    expect(deleteManyResult.Deleted?.map((item) => item.Key)).toEqual(expect.arrayContaining(deleteManyKeys));
+    await expect(client.send(new HeadObjectCommand({ Bucket: bucket, Key: deleteManyKeys[0] }))).rejects.toMatchObject({ name: 'NotFound' });
+
+    const abortKey = 'sdk/all/abort-multipart.txt';
+    const abortUpload = await client.send(new CreateMultipartUploadCommand({ Bucket: bucket, Key: abortKey }));
+    expect(abortUpload.UploadId).toBeTruthy();
+    const abortUploads = await client.send(new ListMultipartUploadsCommand({ Bucket: bucket }));
+    expect(abortUploads.Uploads?.some((item) => item.UploadId === abortUpload.UploadId)).toBe(true);
+    await client.send(new AbortMultipartUploadCommand({ Bucket: bucket, Key: abortKey, UploadId: abortUpload.UploadId }));
+
+    const multipartKey = 'sdk/all/complete-multipart.txt';
+    const multipart = await client.send(new CreateMultipartUploadCommand({ Bucket: bucket, Key: multipartKey }));
+    const part = await client.send(new UploadPartCommand({ Bucket: bucket, Key: multipartKey, UploadId: multipart.UploadId, PartNumber: 1, Body: Buffer.from('part-body') }));
+    const parts = await client.send(new ListPartsCommand({ Bucket: bucket, Key: multipartKey, UploadId: multipart.UploadId }));
+    expect(parts.Parts?.[0]?.PartNumber).toBe(1);
+    await client.send(new CompleteMultipartUploadCommand({
+      Bucket: bucket,
+      Key: multipartKey,
+      UploadId: multipart.UploadId,
+      MultipartUpload: { Parts: [{ ETag: part.ETag, PartNumber: 1 }] },
+    }));
+    const completedMultipart = await client.send(new GetObjectCommand({ Bucket: bucket, Key: multipartKey }));
+    expect(await streamToString(completedMultipart.Body)).toBe('part-body');
+
+    const presignedKey = 'sdk/all/official-presigner.txt';
+    const presignedPut = await getSignedUrl(client, new PutObjectCommand({ Bucket: bucket, Key: presignedKey }), { expiresIn: 300 });
+    const presignedPutResponse = await fetch(presignedPut, { method: 'PUT', body: 'official-presigner-body' });
+    expect(presignedPutResponse.status).toBe(200);
+    const presignedGet = await getSignedUrl(client, new GetObjectCommand({ Bucket: bucket, Key: presignedKey }), { expiresIn: 300 });
+    const presignedGetResponse = await fetch(presignedGet);
+    expect(presignedGetResponse.status).toBe(200);
+    expect(await presignedGetResponse.text()).toBe('official-presigner-body');
 
     running.close = () => Promise.resolve();
     client.destroy();
