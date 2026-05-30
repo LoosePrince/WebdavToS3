@@ -28,7 +28,7 @@ import {
   type ObjectVersionState,
 } from './metadata-store.js';
 import * as objectSemantics from './object-semantics.js';
-import { createWebdavStorageBackend } from './storage-backend.js';
+import type { StorageBackendFactory } from './storage-backend.js';
 
 interface AuthResult {
   ok: boolean;
@@ -41,6 +41,7 @@ interface S3RequestContext {
   req: FastifyRequest;
   reply: FastifyReply;
   registry: TenantRegistry;
+  storageBackendFactory: StorageBackendFactory;
   requestId: string;
   method: string;
   pathname: string;
@@ -59,8 +60,9 @@ export async function handleS3Request(
   req: FastifyRequest,
   reply: FastifyReply,
   tenantRegistry: TenantRegistry,
+  storageBackendFactory: StorageBackendFactory,
 ): Promise<void> {
-  const ctx = buildContext(req, reply, tenantRegistry);
+  const ctx = buildContext(req, reply, tenantRegistry, storageBackendFactory);
 
   if (ctx.method === 'OPTIONS') {
     return sendCorsPreflight(reply, ctx.requestId);
@@ -200,7 +202,12 @@ export async function handleS3Request(
   }
 }
 
-function buildContext(req: FastifyRequest, reply: FastifyReply, registry: TenantRegistry): S3RequestContext {
+function buildContext(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  registry: TenantRegistry,
+  storageBackendFactory: StorageBackendFactory,
+): S3RequestContext {
   const pathname = req.url.split('?')[0];
   const rawQueryString = req.url.includes('?') ? req.url.slice(req.url.indexOf('?') + 1) : '';
   const query = req.query as Record<string, string | undefined>;
@@ -218,12 +225,13 @@ function buildContext(req: FastifyRequest, reply: FastifyReply, registry: Tenant
   const ownerTenant = bucketName ? findTenantByBucket(registry, bucketName) : undefined;
   const bucket = bucketName ? ownerTenant?.buckets.get(bucketName) : undefined;
   const upstream = bucket ? ownerTenant?.upstreams.get(bucket.upstreamId) : undefined;
-  const backend = upstream ? createWebdavStorageBackend(upstream) : undefined;
+  const backend = upstream ? storageBackendFactory.getBackend(upstream) : undefined;
 
   return {
     req,
     reply,
     registry,
+    storageBackendFactory,
     requestId,
     method,
     pathname,
@@ -495,7 +503,7 @@ async function handleCopyObject(ctx: S3RequestContext) {
     return sendS3Error(ctx.reply, 'NoSuchBucket', 'The source bucket does not exist', 404, ctx.requestId);
   }
 
-  const sourceBackend = sourceBucket === ctx.bucket!.name ? undefined : createWebdavStorageBackend(sourceUpstream);
+  const sourceBackend = sourceBucket === ctx.bucket!.name ? undefined : ctx.storageBackendFactory.getBackend(sourceUpstream);
   const sourceBlobStore = sourceBucket === ctx.bucket!.name ? ctx.blobStore! : sourceBackend!.blobStore;
   const sourceState = sourceBucket === ctx.bucket!.name ? ctx.state! : sourceBackend!.metadataStore;
   const sourceMetadata = await sourceState.getObjectMetadata(sourceBucket, sourceKey);
@@ -521,12 +529,22 @@ async function handleCopyObject(ctx: S3RequestContext) {
 }
 
 async function handleListObjects(ctx: S3RequestContext) {
-  const result = await ctx.blobStore!.listObjects(ctx.bucket!, {
+  const params = {
     prefix: ctx.query.prefix,
     delimiter: ctx.query.delimiter,
     maxKeys: ctx.query['max-keys'] ? parseInt(ctx.query['max-keys'], 10) : undefined,
     continuationToken: ctx.query['continuation-token'] ?? ctx.query.marker,
-  });
+  };
+  const result = ctx.state!.listObjectMetadata
+    ? {
+      name: ctx.bucket!.name,
+      prefix: params.prefix ?? '',
+      maxKeys: Math.min(params.maxKeys ?? 1000, 1000),
+      keyCount: 0,
+      ...(await ctx.state!.listObjectMetadata(ctx.bucketName!, params)),
+    }
+    : await ctx.blobStore!.listObjects(ctx.bucket!, params);
+  result.keyCount = result.contents.length;
   return ctx.reply.status(200).headers(XML_HEADERS).send(listObjectsV2Xml(result));
 }
 
@@ -750,6 +768,27 @@ async function handleCompleteMultipartUpload(ctx: S3RequestContext) {
   }
   const finalBody = Buffer.concat(buffers);
   const result = await ctx.blobStore!.putObject(ctx.bucket!, ctx.key, finalBody, finalBody.length);
+  const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
+  const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  const versionId = bucketState.versioning === 'Enabled' ? objectSemantics.createVersionId(ctx.bucketName!, ctx.key) : undefined;
+  const metadata: ObjectMetadataState = {
+    bucket: ctx.bucketName!,
+    key: ctx.key,
+    etag: result.etag,
+    size: finalBody.length,
+    lastModified: new Date().toISOString(),
+    contentType: state.contentType ?? 'application/octet-stream',
+    userMetadata: state.metadata ?? {},
+    tagging: existing?.isDeleteMarker ? {} : existing?.tagging ?? {},
+    versionId,
+  };
+  await ctx.state!.putObjectMetadata(metadata);
+  if (versionId) {
+    const bodyPath = ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
+    await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
+    await ctx.blobStore!.putRaw(bodyPath, finalBody, finalBody.length);
+    await ctx.state!.putObjectVersion({ ...metadata, versionId, isLatest: true, bodyPath });
+  }
   await ctx.state!.deleteMultipartUpload(ctx.bucketName!, uploadId);
   return sendXml(ctx, 200, completeMultipartUploadXml(ctx.bucketName!, ctx.key, result.etag));
 }

@@ -9,6 +9,26 @@ import {
 
 export type { BucketState, MultipartUploadState, ObjectMetadataState, ObjectVersionState };
 
+export interface ListObjectMetadataParams {
+  prefix?: string;
+  delimiter?: string;
+  maxKeys?: number;
+  continuationToken?: string;
+}
+
+export interface ListObjectMetadataResult {
+  contents: Array<{
+    key: string;
+    lastModified: string;
+    etag: string;
+    size: number;
+    storageClass: string;
+  }>;
+  commonPrefixes?: string[];
+  isTruncated: boolean;
+  nextContinuationToken?: string;
+}
+
 export interface MetadataStore {
   getBucketState(bucketName: string): Promise<BucketState>;
   putBucketState(state: BucketState): Promise<void>;
@@ -23,6 +43,7 @@ export interface MetadataStore {
   putMultipartUpload(state: MultipartUploadState): Promise<void>;
   deleteMultipartUpload(bucket: string, uploadId: string): Promise<void>;
   getObjectMetadata(bucket: string, key: string): Promise<ObjectMetadataState | null>;
+  listObjectMetadata?(bucket: string, params: ListObjectMetadataParams): Promise<ListObjectMetadataResult>;
   putObjectMetadata(state: ObjectMetadataState): Promise<void>;
   deleteObjectMetadata(bucket: string, key: string): Promise<void>;
   listObjectVersions(bucket: string): Promise<ObjectVersionState[]>;

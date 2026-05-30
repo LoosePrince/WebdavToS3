@@ -9,6 +9,10 @@
   "s3": {
     "region": "us-east-1"
   },
+  "metadata": {
+    "driver": "sqlite",
+    "path": "./data/webdavtos3.sqlite"
+  },
   "tenants": [
     {
       "id": "tenant-a",

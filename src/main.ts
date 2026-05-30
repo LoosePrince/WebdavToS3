@@ -9,6 +9,7 @@ import {
 } from './tenancy/tenant-registry.js';
 import { info, error } from './observability/logger.js';
 import { startLifecycleWorker } from './s3/lifecycle/worker.js';
+import { createStorageBackendFactory } from './s3/storage-backend.js';
 
 function buildTenantRegistry(): TenantRegistry {
   const config = loadConfig();
@@ -60,8 +61,9 @@ async function main() {
     const tenantRegistry = buildTenantRegistry();
     const adminKey = generateAdminKey();
 
-    const app = buildApp({ tenantRegistry, adminKey });
-    startLifecycleWorker(tenantRegistry, config.lifecycle);
+    const storageBackendFactory = createStorageBackendFactory({ metadata: config.metadata });
+    const app = buildApp({ tenantRegistry, adminKey, storageBackendFactory });
+    startLifecycleWorker(tenantRegistry, config.lifecycle, storageBackendFactory);
 
     await app.listen({
       host: config.server.host,

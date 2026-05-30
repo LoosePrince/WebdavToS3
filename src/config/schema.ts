@@ -45,6 +45,14 @@ const LifecycleConfigSchema = z.object({
   expireDeleteMarkersAfterMs: z.number().positive().optional(),
 });
 
+const MetadataConfigSchema = z.discriminatedUnion('driver', [
+  z.object({ driver: z.literal('webdav') }),
+  z.object({
+    driver: z.literal('sqlite'),
+    path: z.string().min(1).default('./data/webdavtos3.sqlite'),
+  }),
+]);
+
 export const AppConfigSchema = z.object({
   server: ServerConfigSchema.optional().default({
     host: '0.0.0.0',
@@ -54,6 +62,7 @@ export const AppConfigSchema = z.object({
     requestTimeoutMs: 300000,
   }),
   s3: S3ConfigSchema.optional().default({ region: 'us-east-1' }),
+  metadata: MetadataConfigSchema.optional().default({ driver: 'webdav' }),
   lifecycle: LifecycleConfigSchema.optional().default({ enabled: false, intervalMs: 3600000 }),
   tenants: z.array(TenantConfigSchema).min(1),
 });
@@ -62,3 +71,4 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
 export type TenantConfig = z.infer<typeof TenantConfigSchema>;
 export type WebdavUpstreamConfig = z.infer<typeof WebdavUpstreamSchema>;
 export type BucketBindingConfig = z.infer<typeof BucketBindingSchema>;
+export type MetadataConfig = z.infer<typeof MetadataConfigSchema>;

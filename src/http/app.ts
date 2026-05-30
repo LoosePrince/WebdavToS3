@@ -5,13 +5,22 @@ import { registerAdminRoutes } from '../admin/routes.js';
 import { createRequestContext, runWithContext, getRequestId } from '../observability/request-context.js';
 import { info, error } from '../observability/logger.js';
 
+import {
+  createStorageBackendFactory,
+  type MetadataBackendConfig,
+  type StorageBackendFactory,
+} from '../s3/storage-backend.js';
+
 export interface AppOptions {
   tenantRegistry: TenantRegistry;
   adminKey: string;
+  metadata?: MetadataBackendConfig;
+  storageBackendFactory?: StorageBackendFactory;
 }
 
 export function buildApp(opts: AppOptions): FastifyInstance {
   const { tenantRegistry, adminKey } = opts;
+  const storageBackendFactory = opts.storageBackendFactory ?? createStorageBackendFactory({ metadata: opts.metadata });
 
   const app = Fastify({
     logger: false,
@@ -34,7 +43,10 @@ export function buildApp(opts: AppOptions): FastifyInstance {
   app.addContentTypeParser('binary/octet-stream', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
   app.addContentTypeParser('*', { parseAs: 'buffer' }, async (_req: any, body: Buffer) => body);
 
-  // Response logging
+  app.addHook('onClose', async () => {
+    storageBackendFactory.close();
+  });
+
   app.addHook('onResponse', async (req: FastifyRequest, reply: FastifyReply) => {
     const requestId = (req as any).__requestId || getRequestId();
     if (!reply.sent) {
@@ -71,7 +83,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
   // S3 catch-all
   app.all('*', async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      await handleS3Request(req, reply, tenantRegistry);
+      await handleS3Request(req, reply, tenantRegistry, storageBackendFactory);
     } catch (err) {
       const requestId = (req as any).__requestId || 'unknown';
       error('unhandled error', { requestId, error: String(err) });
