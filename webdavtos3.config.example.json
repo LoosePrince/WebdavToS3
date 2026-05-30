@@ -13,6 +13,11 @@
     "driver": "sqlite",
     "path": "./data/webdavtos3.sqlite"
   },
+  "lifecycle": {
+    "enabled": false,
+    "intervalMs": 3600000,
+    "gcUnreferencedBlobs": false
+  },
   "tenants": [
     {
       "id": "tenant-a",

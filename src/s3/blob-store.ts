@@ -8,6 +8,11 @@ import type { HeadObjectResult } from './operations/head-object.js';
 import type { PutObjectResult } from './operations/put-object.js';
 import type { ListObjectsV2Result } from './xml/serializer.js';
 
+export interface RawBlobEntry {
+  path: string;
+  isCollection: boolean;
+}
+
 export interface BlobStore {
   getObject(bucket: BucketBinding, key: string, rangeHeader?: string): Promise<GetObjectResult>;
   headObject(bucket: BucketBinding, key: string): Promise<HeadObjectResult>;
@@ -23,6 +28,7 @@ export interface BlobStore {
       continuationToken?: string;
     },
   ): Promise<ListObjectsV2Result>;
+  listRaw?(path: string): Promise<RawBlobEntry[]>;
   getRaw(path: string, rangeHeader?: string): Promise<WebdavResponse>;
   putRaw(path: string, body: NodeJS.ReadableStream | Buffer, contentLength?: number): Promise<WebdavResponse>;
   deleteRaw(path: string): Promise<WebdavResponse>;
@@ -64,6 +70,17 @@ export class WebdavBlobStore implements BlobStore {
     return listObjectsV2(this.client, bucket, params);
   }
 
+  async listRaw(path: string): Promise<RawBlobEntry[]> {
+    const root = normalizeRawPath(path);
+    const entries = await this.client.list(path);
+    return entries
+      .map((entry) => ({
+        path: normalizeRawPath(entry.href),
+        isCollection: entry.isCollection,
+      }))
+      .filter((entry) => entry.path !== root);
+  }
+
   getRaw(path: string, rangeHeader?: string): Promise<WebdavResponse> {
     const headers = rangeHeader ? { range: rangeHeader } : undefined;
     return this.client.request('GET', path, { headers });
@@ -84,4 +101,13 @@ export class WebdavBlobStore implements BlobStore {
 
 export function createWebdavBlobStore(client: WebdavClient): BlobStore {
   return new WebdavBlobStore(client);
+}
+
+function normalizeRawPath(href: string): string {
+  try {
+    const pathname = new URL(href, 'http://webdav.local').pathname;
+    return decodeURIComponent(pathname).replace(/\/+$/, '') || '/';
+  } catch {
+    return href.replace(/\/+$/, '') || '/';
+  }
 }

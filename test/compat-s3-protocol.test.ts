@@ -461,6 +461,11 @@ function quotedMd5(body: Buffer): string {
   return `"${createHash('md5').update(body).digest('hex')}"`;
 }
 
+function contentBlobPath(body: Buffer): string {
+  const digest = createHash('sha256').update(body).digest('hex');
+  return `/.webdavtos3-blobs/sha256/${digest.slice(0, 2)}/${digest.slice(2, 4)}/${digest}`;
+}
+
 function propfindXml(pathname: string, files: Map<string, Buffer>, collections: Set<string>): string {
   const normalized = pathname.replace(/\/+$/, '') || '/';
   const prefix = normalized === '/' ? '/' : `${normalized}/`;
@@ -887,6 +892,156 @@ describe('S3 compatibility flows', () => {
     expect(await rawBlob.text()).toBe('shared-blob-body');
   });
 
+  it('garbage-collects only unreferenced SQLite content blobs', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const tempDir = await mkdtemp(join(tmpdir(), 'webdavtos3-blob-gc-'));
+    tempDirs.push(tempDir);
+
+    const metadataPath = join(tempDir, 'metadata.sqlite');
+    const registry = new TenantRegistry();
+    registry.add(createTenant(webdav.endpoint));
+    const app = buildApp({
+      tenantRegistry: registry,
+      adminKey: 'test-admin-key',
+      metadata: { driver: 'sqlite', path: metadataPath },
+    });
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const versioningPath = '/uniid';
+    const versioningQuery = 'versioning=';
+    const versioningBody = Buffer.from('<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>');
+    const enableVersioningResponse = await app.inject({
+      method: 'PUT',
+      url: `${versioningPath}?${versioningQuery}`,
+      payload: versioningBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: versioningPath,
+        queryString: versioningQuery,
+        host,
+        payloadHash: createHash('sha256').update(versioningBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versioningBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(enableVersioningResponse.statusCode).toBe(200);
+
+    const versionedPath = '/uniid/gc-versioned.txt';
+    const versionBodyOne = Buffer.from('gc-version-one');
+    const putVersionOneResponse = await app.inject({
+      method: 'PUT',
+      url: versionedPath,
+      payload: versionBodyOne,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: versionedPath,
+        host,
+        payloadHash: createHash('sha256').update(versionBodyOne).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versionBodyOne.length),
+          'content-type': 'text/plain',
+        },
+      }),
+    });
+    expect(putVersionOneResponse.statusCode).toBe(200);
+    const versionOneId = putVersionOneResponse.headers['x-amz-version-id'] as string;
+
+    const versionBodyTwo = Buffer.from('gc-version-two');
+    const putVersionTwoResponse = await app.inject({
+      method: 'PUT',
+      url: versionedPath,
+      payload: versionBodyTwo,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: versionedPath,
+        host,
+        payloadHash: createHash('sha256').update(versionBodyTwo).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versionBodyTwo.length),
+          'content-type': 'text/plain',
+        },
+      }),
+    });
+    expect(putVersionTwoResponse.statusCode).toBe(200);
+    const versionTwoId = putVersionTwoResponse.headers['x-amz-version-id'] as string;
+    expect(versionTwoId).not.toBe(versionOneId);
+
+    const stalePath = '/archive/gc-stale.txt';
+    const staleBody = Buffer.from('gc-stale-body');
+    const putStaleResponse = await app.inject({
+      method: 'PUT',
+      url: stalePath,
+      payload: staleBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: stalePath,
+        host,
+        payloadHash: createHash('sha256').update(staleBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(staleBody.length),
+          'content-type': 'text/plain',
+        },
+      }),
+    });
+    expect(putStaleResponse.statusCode).toBe(200);
+
+    const deleteStaleResponse = await app.inject({
+      method: 'DELETE',
+      url: stalePath,
+      headers: signRequest({ method: 'DELETE', pathname: stalePath, host }),
+    });
+    expect(deleteStaleResponse.statusCode).toBe(204);
+
+    const versionOneDigest = createHash('sha256').update(versionBodyOne).digest('hex');
+    const versionOneBlobPath = `/.webdavtos3-blobs/sha256/${versionOneDigest.slice(0, 2)}/${versionOneDigest.slice(2, 4)}/${versionOneDigest}`;
+    const versionTwoDigest = createHash('sha256').update(versionBodyTwo).digest('hex');
+    const versionTwoBlobPath = `/.webdavtos3-blobs/sha256/${versionTwoDigest.slice(0, 2)}/${versionTwoDigest.slice(2, 4)}/${versionTwoDigest}`;
+    const staleDigest = createHash('sha256').update(staleBody).digest('hex');
+    const staleBlobPath = `/.webdavtos3-blobs/sha256/${staleDigest.slice(0, 2)}/${staleDigest.slice(2, 4)}/${staleDigest}`;
+    expect((await fetch(`${webdav.endpoint}${versionOneBlobPath}`)).status).toBe(200);
+    expect((await fetch(`${webdav.endpoint}${versionTwoBlobPath}`)).status).toBe(200);
+    expect((await fetch(`${webdav.endpoint}${staleBlobPath}`)).status).toBe(200);
+
+    const lifecycleFactory = createStorageBackendFactory({ metadata: { driver: 'sqlite', path: metadataPath } });
+    try {
+      const result = await runLifecycleOnce(registry, {
+        enabled: true,
+        intervalMs: 1000,
+        gcUnreferencedBlobs: true,
+      }, lifecycleFactory);
+      expect(result.scannedBlobs).toBe(3);
+      expect(result.removedBlobs).toBe(1);
+    } finally {
+      lifecycleFactory.close();
+    }
+
+    expect((await fetch(`${webdav.endpoint}${versionOneBlobPath}`)).status).toBe(200);
+    expect((await fetch(`${webdav.endpoint}${versionTwoBlobPath}`)).status).toBe(200);
+    expect((await fetch(`${webdav.endpoint}${staleBlobPath}`)).status).toBe(404);
+
+    const readVersionOneQuery = `versionId=${encodeURIComponent(versionOneId)}`;
+    const readVersionOneResponse = await app.inject({
+      method: 'GET',
+      url: `${versionedPath}?${readVersionOneQuery}`,
+      headers: signRequest({ method: 'GET', pathname: versionedPath, queryString: readVersionOneQuery, host }),
+    });
+    expect(readVersionOneResponse.statusCode).toBe(200);
+    expect(readVersionOneResponse.body).toBe('gc-version-one');
+
+    const readCurrentResponse = await app.inject({
+      method: 'GET',
+      url: versionedPath,
+      headers: signRequest({ method: 'GET', pathname: versionedPath, host }),
+    });
+    expect(readCurrentResponse.statusCode).toBe(200);
+    expect(readCurrentResponse.headers['x-amz-version-id']).toBe(versionTwoId);
+    expect(readCurrentResponse.body).toBe('gc-version-two');
+  });
+
   it('cleans multipart part blobs on abort and complete', async () => {
     const webdav = await startMemoryWebdav();
     webdavs.push(webdav);
@@ -1006,6 +1161,224 @@ describe('S3 compatibility flows', () => {
     });
     expect(completeReadResponse.statusCode).toBe(200);
     expect(completeReadResponse.body).toBe('hello world');
+  });
+
+  it('keeps SQLite version metadata consistent across concurrent writes', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const tempDir = await mkdtemp(join(tmpdir(), 'webdavtos3-concurrent-versions-'));
+    tempDirs.push(tempDir);
+    const app = createSqliteApp(webdav.endpoint, join(tempDir, 'metadata.sqlite'));
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const versioningPath = '/uniid';
+    const versioningQuery = 'versioning=';
+    const versioningBody = Buffer.from('<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>');
+    const enableVersioningResponse = await app.inject({
+      method: 'PUT',
+      url: `${versioningPath}?${versioningQuery}`,
+      payload: versioningBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: versioningPath,
+        queryString: versioningQuery,
+        host,
+        payloadHash: createHash('sha256').update(versioningBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versioningBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(enableVersioningResponse.statusCode).toBe(200);
+
+    const pathname = '/uniid/concurrent-versioned.txt';
+    const bodies = Array.from({ length: 6 }, (_, index) => Buffer.from(`concurrent-version-${index}`));
+    const putResponses = await Promise.all(bodies.map((body) => app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: body,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(body).digest('hex'),
+        extraHeaders: {
+          'content-length': String(body.length),
+          'content-type': 'text/plain',
+        },
+      }),
+    })));
+
+    for (const response of putResponses) expect(response.statusCode).toBe(200);
+    const versionIds = putResponses.map((response) => response.headers['x-amz-version-id'] as string);
+    expect(new Set(versionIds).size).toBe(bodies.length);
+
+    await Promise.all(versionIds.map(async (versionId, index) => {
+      const queryString = `versionId=${encodeURIComponent(versionId)}`;
+      const response = await app.inject({
+        method: 'GET',
+        url: `${pathname}?${queryString}`,
+        headers: signRequest({ method: 'GET', pathname, queryString, host }),
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-amz-version-id']).toBe(versionId);
+      expect(response.body).toBe(bodies[index]!.toString('utf-8'));
+    }));
+
+    const listVersionsQuery = 'versions=&prefix=concurrent-versioned.txt';
+    const listVersionsResponse = await app.inject({
+      method: 'GET',
+      url: `/uniid?${listVersionsQuery}`,
+      headers: signRequest({ method: 'GET', pathname: '/uniid', queryString: listVersionsQuery, host }),
+    });
+    expect(listVersionsResponse.statusCode).toBe(200);
+    for (const versionId of versionIds) expect(listVersionsResponse.body).toContain(`<VersionId>${versionId}</VersionId>`);
+
+    const currentResponse = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(currentResponse.statusCode).toBe(200);
+    expect(versionIds).toContain(currentResponse.headers['x-amz-version-id']);
+    expect(bodies.map((body) => body.toString('utf-8'))).toContain(currentResponse.body);
+
+    expect((await fetch(`${webdav.endpoint}${pathname}`)).status).toBe(404);
+    for (const body of bodies) expect((await fetch(`${webdav.endpoint}${contentBlobPath(body)}`)).status).toBe(200);
+  });
+
+  it('keeps multipart state recoverable after invalid complete and stores large SQLite multipart bodies as content blobs', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const tempDir = await mkdtemp(join(tmpdir(), 'webdavtos3-large-multipart-'));
+    tempDirs.push(tempDir);
+
+    const metadataPath = join(tempDir, 'metadata.sqlite');
+    const registry = new TenantRegistry();
+    registry.add(createTenant(webdav.endpoint));
+    const app = buildApp({
+      tenantRegistry: registry,
+      adminKey: 'test-admin-key',
+      metadata: { driver: 'sqlite', path: metadataPath },
+    });
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const pathname = '/uniid/large-recoverable-multipart.bin';
+    const createQuery = 'uploads=';
+    const createResponse = await app.inject({
+      method: 'POST',
+      url: `${pathname}?${createQuery}`,
+      headers: signRequest({ method: 'POST', pathname, queryString: createQuery, host }),
+    });
+    expect(createResponse.statusCode).toBe(200);
+    const uploadId = createResponse.body.match(/<UploadId>([^<]+)<\/UploadId>/)?.[1];
+    expect(uploadId).toBeTruthy();
+
+    const partOne = Buffer.alloc(128 * 1024, 'a');
+    const partTwo = Buffer.alloc(192 * 1024, 'b');
+    for (const [partNumber, body] of [[1, partOne], [2, partTwo]] as const) {
+      const queryString = `partNumber=${partNumber}&uploadId=${encodeURIComponent(uploadId!)}`;
+      const response = await app.inject({
+        method: 'PUT',
+        url: `${pathname}?${queryString}`,
+        payload: body,
+        headers: signRequest({
+          method: 'PUT',
+          pathname,
+          queryString,
+          host,
+          payloadHash: createHash('sha256').update(body).digest('hex'),
+          extraHeaders: { 'content-length': String(body.length) },
+        }),
+      });
+      expect(response.statusCode).toBe(200);
+    }
+
+    const partPathOne = `/.webdavtos3-system/buckets/uniid/multipart/${encodeURIComponent(uploadId!)}/parts/1`;
+    const partPathTwo = `/.webdavtos3-system/buckets/uniid/multipart/${encodeURIComponent(uploadId!)}/parts/2`;
+    expect((await fetch(`${webdav.endpoint}${partPathOne}`)).status).toBe(200);
+    expect((await fetch(`${webdav.endpoint}${partPathTwo}`)).status).toBe(200);
+
+    const invalidCompleteBody = Buffer.from('<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part><Part><PartNumber>3</PartNumber></Part></CompleteMultipartUpload>');
+    const completeQuery = `uploadId=${encodeURIComponent(uploadId!)}`;
+    const invalidCompleteResponse = await app.inject({
+      method: 'POST',
+      url: `${pathname}?${completeQuery}`,
+      payload: invalidCompleteBody,
+      headers: signRequest({
+        method: 'POST',
+        pathname,
+        queryString: completeQuery,
+        host,
+        payloadHash: createHash('sha256').update(invalidCompleteBody).digest('hex'),
+        extraHeaders: { 'content-length': String(invalidCompleteBody.length) },
+      }),
+    });
+    expect(invalidCompleteResponse.statusCode).toBe(400);
+    expect(invalidCompleteResponse.body).toContain('InvalidPart');
+
+    const listPartsResponse = await app.inject({
+      method: 'GET',
+      url: `${pathname}?${completeQuery}`,
+      headers: signRequest({ method: 'GET', pathname, queryString: completeQuery, host }),
+    });
+    expect(listPartsResponse.statusCode).toBe(200);
+    expect(listPartsResponse.body).toContain('<PartNumber>1</PartNumber>');
+    expect(listPartsResponse.body).toContain('<PartNumber>2</PartNumber>');
+    expect((await fetch(`${webdav.endpoint}${partPathOne}`)).status).toBe(200);
+    expect((await fetch(`${webdav.endpoint}${partPathTwo}`)).status).toBe(200);
+
+    const validCompleteBody = Buffer.from('<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part><Part><PartNumber>2</PartNumber></Part></CompleteMultipartUpload>');
+    const completeResponse = await app.inject({
+      method: 'POST',
+      url: `${pathname}?${completeQuery}`,
+      payload: validCompleteBody,
+      headers: signRequest({
+        method: 'POST',
+        pathname,
+        queryString: completeQuery,
+        host,
+        payloadHash: createHash('sha256').update(validCompleteBody).digest('hex'),
+        extraHeaders: { 'content-length': String(validCompleteBody.length) },
+      }),
+    });
+    expect(completeResponse.statusCode).toBe(200);
+
+    expect((await fetch(`${webdav.endpoint}${partPathOne}`)).status).toBe(404);
+    expect((await fetch(`${webdav.endpoint}${partPathTwo}`)).status).toBe(404);
+    expect((await fetch(`${webdav.endpoint}${pathname}`)).status).toBe(404);
+
+    const finalBody = Buffer.concat([partOne, partTwo]);
+    const finalBlobPath = contentBlobPath(finalBody);
+    const finalRawBlob = await fetch(`${webdav.endpoint}${finalBlobPath}`);
+    expect(finalRawBlob.status).toBe(200);
+    expect((await finalRawBlob.arrayBuffer()).byteLength).toBe(finalBody.length);
+
+    const readResponse = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(readResponse.statusCode).toBe(200);
+    expect(readResponse.headers['content-length']).toBe(String(finalBody.length));
+    expect(readResponse.body).toBe(finalBody.toString('utf-8'));
+
+    const lifecycleFactory = createStorageBackendFactory({ metadata: { driver: 'sqlite', path: metadataPath } });
+    try {
+      const result = await runLifecycleOnce(registry, {
+        enabled: true,
+        intervalMs: 1000,
+        gcUnreferencedBlobs: true,
+      }, lifecycleFactory);
+      expect(result.scannedBlobs).toBe(1);
+      expect(result.removedBlobs).toBe(0);
+    } finally {
+      lifecycleFactory.close();
+    }
+    expect((await fetch(`${webdav.endpoint}${finalBlobPath}`)).status).toBe(200);
   });
 
   it('uploads, lists, completes, and reads a multipart object', async () => {

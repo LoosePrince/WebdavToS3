@@ -43,6 +43,7 @@ const LifecycleConfigSchema = z.object({
   intervalMs: z.number().positive().default(3600000),
   expireNoncurrentVersionsAfterMs: z.number().positive().optional(),
   expireDeleteMarkersAfterMs: z.number().positive().optional(),
+  gcUnreferencedBlobs: z.boolean().default(false),
 });
 
 const MetadataConfigSchema = z.discriminatedUnion('driver', [
@@ -63,7 +64,11 @@ export const AppConfigSchema = z.object({
   }),
   s3: S3ConfigSchema.optional().default({ region: 'us-east-1' }),
   metadata: MetadataConfigSchema.optional().default({ driver: 'webdav' }),
-  lifecycle: LifecycleConfigSchema.optional().default({ enabled: false, intervalMs: 3600000 }),
+  lifecycle: LifecycleConfigSchema.optional().default({
+    enabled: false,
+    intervalMs: 3600000,
+    gcUnreferencedBlobs: false,
+  }),
   tenants: z.array(TenantConfigSchema).min(1),
 });
 
