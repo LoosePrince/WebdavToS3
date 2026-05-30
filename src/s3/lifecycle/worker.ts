@@ -45,7 +45,9 @@ export async function runLifecycleOnce(
             && ageMs >= options.expireDeleteMarkersAfterMs;
           if (!expiredNoncurrent && !expiredDeleteMarker) continue;
           await backend.metadataStore.deleteObjectVersion(bucket.name, version.key, version.versionId);
-          if (version.bodyPath) await backend.blobStore.deleteRaw(version.bodyPath).catch(() => undefined);
+          if (version.bodyPath && typeof backend.metadataStore.listObjectMetadata !== 'function') {
+            await backend.blobStore.deleteRaw(version.bodyPath).catch(() => undefined);
+          }
           removedVersions += 1;
         }
       }

@@ -887,12 +887,16 @@ async function handleCompleteMultipartUpload(ctx: S3RequestContext) {
     }
     await ctx.state!.putObjectVersion({ ...metadata, versionId, isLatest: true, bodyPath });
   }
+  await cleanupMultipartPartBlobs(ctx, state.parts);
   await ctx.state!.deleteMultipartUpload(ctx.bucketName!, uploadId);
   return sendXml(ctx, 200, completeMultipartUploadXml(ctx.bucketName!, ctx.key, result.etag));
 }
 
 async function handleAbortMultipartUpload(ctx: S3RequestContext) {
   const uploadId = ctx.query.uploadId!;
+  const state = await requireMultipart(ctx, uploadId);
+  if (!state) return;
+  await cleanupMultipartPartBlobs(ctx, state.parts);
   await ctx.state!.deleteMultipartUpload(ctx.bucketName!, uploadId);
   return sendEmpty(ctx, 204);
 }
@@ -904,10 +908,16 @@ async function handleListParts(ctx: S3RequestContext) {
   return sendXml(ctx, 200, listPartsXml(ctx.bucketName!, ctx.key, uploadId, state));
 }
 
+async function cleanupMultipartPartBlobs(ctx: S3RequestContext, parts: Array<{ path: string }>): Promise<void> {
+  for (const part of parts) {
+    await ctx.blobStore!.deleteRaw(part.path).catch(() => undefined);
+  }
+}
+
 async function requireMultipart(ctx: S3RequestContext, uploadId: string): Promise<MultipartUploadState | null> {
   const state = await ctx.state!.getMultipartUpload(ctx.bucketName!, uploadId);
-  if (!state) {
-    sendS3Error(ctx.reply, 'NoSuchUpload', 'The specified multipart upload does not exist', 404, ctx.requestId);
+  if (!state || state.key !== ctx.key) {
+    await sendS3Error(ctx.reply, 'NoSuchUpload', 'The specified multipart upload does not exist', 404, ctx.requestId);
     return null;
   }
   return state;
