@@ -1,6 +1,6 @@
 {
   "name": "webdav-to-s3",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Multi-tenant S3-compatible gateway backed by WebDAV upstreams.",
   "private": true,
   "type": "module",
