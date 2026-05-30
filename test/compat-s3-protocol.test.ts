@@ -603,6 +603,186 @@ describe('S3 compatibility flows', () => {
     expect((await fetch(`${webdav.endpoint}${blobPath}`)).status).toBe(200);
   });
 
+  it('copies SQLite-indexed objects by bodyPath without creating legacy object bodies', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const tempDir = await mkdtemp(join(tmpdir(), 'webdavtos3-copy-blob-'));
+    tempDirs.push(tempDir);
+    const app = createSqliteApp(webdav.endpoint, join(tempDir, 'metadata.sqlite'));
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const sourceBucketPath = '/uniid';
+    const versioningQuery = 'versioning=';
+    const versioningBody = Buffer.from('<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>');
+    const enableSourceVersioningResponse = await app.inject({
+      method: 'PUT',
+      url: `${sourceBucketPath}?${versioningQuery}`,
+      payload: versioningBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: sourceBucketPath,
+        queryString: versioningQuery,
+        host,
+        payloadHash: createHash('sha256').update(versioningBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versioningBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(enableSourceVersioningResponse.statusCode).toBe(200);
+
+    const sourcePath = '/uniid/copy-source-versioned.txt';
+    const firstBody = Buffer.from('copy-version-one');
+    const firstPutResponse = await app.inject({
+      method: 'PUT',
+      url: sourcePath,
+      payload: firstBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: sourcePath,
+        host,
+        payloadHash: createHash('sha256').update(firstBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(firstBody.length),
+          'content-type': 'text/plain',
+          'x-amz-meta-origin': 'copy-source',
+        },
+      }),
+    });
+    expect(firstPutResponse.statusCode).toBe(200);
+    const firstVersionId = firstPutResponse.headers['x-amz-version-id'] as string;
+    expect(firstVersionId).toBeTruthy();
+
+    const secondBody = Buffer.from('copy-version-two');
+    const secondPutResponse = await app.inject({
+      method: 'PUT',
+      url: sourcePath,
+      payload: secondBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: sourcePath,
+        host,
+        payloadHash: createHash('sha256').update(secondBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(secondBody.length),
+          'content-type': 'text/plain',
+          'x-amz-meta-origin': 'copy-source',
+        },
+      }),
+    });
+    expect(secondPutResponse.statusCode).toBe(200);
+    const secondVersionId = secondPutResponse.headers['x-amz-version-id'] as string;
+    expect(secondVersionId).toBeTruthy();
+    expect(secondVersionId).not.toBe(firstVersionId);
+
+    expect((await fetch(`${webdav.endpoint}${sourcePath}`)).status).toBe(404);
+    const firstDigest = createHash('sha256').update(firstBody).digest('hex');
+    const firstBlobPath = `/.webdavtos3-blobs/sha256/${firstDigest.slice(0, 2)}/${firstDigest.slice(2, 4)}/${firstDigest}`;
+    const secondDigest = createHash('sha256').update(secondBody).digest('hex');
+    const secondBlobPath = `/.webdavtos3-blobs/sha256/${secondDigest.slice(0, 2)}/${secondDigest.slice(2, 4)}/${secondDigest}`;
+    expect((await fetch(`${webdav.endpoint}${firstBlobPath}`)).status).toBe(200);
+    expect((await fetch(`${webdav.endpoint}${secondBlobPath}`)).status).toBe(200);
+
+    const specificCopyPath = '/archive/copied-specific-version.txt';
+    const specificCopySource = `/uniid/copy-source-versioned.txt?versionId=${encodeURIComponent(firstVersionId)}`;
+    const specificCopyResponse = await app.inject({
+      method: 'PUT',
+      url: specificCopyPath,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: specificCopyPath,
+        host,
+        extraHeaders: {
+          'x-amz-copy-source': specificCopySource,
+        },
+      }),
+    });
+    expect(specificCopyResponse.statusCode).toBe(200);
+
+    const specificReadResponse = await app.inject({
+      method: 'GET',
+      url: specificCopyPath,
+      headers: signRequest({ method: 'GET', pathname: specificCopyPath, host }),
+    });
+    expect(specificReadResponse.statusCode).toBe(200);
+    expect(specificReadResponse.body).toBe('copy-version-one');
+    expect(specificReadResponse.headers['x-amz-version-id']).toBeUndefined();
+    expect(specificReadResponse.headers['x-amz-meta-origin']).toBe('copy-source');
+    expect((await fetch(`${webdav.endpoint}${specificCopyPath}`)).status).toBe(404);
+
+    const archiveBucketPath = '/archive';
+    const enableArchiveVersioningResponse = await app.inject({
+      method: 'PUT',
+      url: `${archiveBucketPath}?${versioningQuery}`,
+      payload: versioningBody,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: archiveBucketPath,
+        queryString: versioningQuery,
+        host,
+        payloadHash: createHash('sha256').update(versioningBody).digest('hex'),
+        extraHeaders: {
+          'content-length': String(versioningBody.length),
+          'content-type': 'application/xml',
+        },
+      }),
+    });
+    expect(enableArchiveVersioningResponse.statusCode).toBe(200);
+
+    const currentCopyPath = '/archive/copied-current-versioned.txt';
+    const currentCopyResponse = await app.inject({
+      method: 'PUT',
+      url: currentCopyPath,
+      headers: signRequest({
+        method: 'PUT',
+        pathname: currentCopyPath,
+        host,
+        extraHeaders: {
+          'x-amz-copy-source': '/uniid/copy-source-versioned.txt',
+        },
+      }),
+    });
+    expect(currentCopyResponse.statusCode).toBe(200);
+    const copiedVersionId = currentCopyResponse.headers['x-amz-version-id'] as string;
+    expect(copiedVersionId).toBeTruthy();
+
+    const copiedVersionQuery = `versionId=${encodeURIComponent(copiedVersionId)}`;
+    const currentVersionReadResponse = await app.inject({
+      method: 'GET',
+      url: `${currentCopyPath}?${copiedVersionQuery}`,
+      headers: signRequest({ method: 'GET', pathname: currentCopyPath, queryString: copiedVersionQuery, host }),
+    });
+    expect(currentVersionReadResponse.statusCode).toBe(200);
+    expect(currentVersionReadResponse.headers['x-amz-version-id']).toBe(copiedVersionId);
+    expect(currentVersionReadResponse.body).toBe('copy-version-two');
+    expect((await fetch(`${webdav.endpoint}${currentCopyPath}`)).status).toBe(404);
+
+    const deleteSourceResponse = await app.inject({
+      method: 'DELETE',
+      url: sourcePath,
+      headers: signRequest({ method: 'DELETE', pathname: sourcePath, host }),
+    });
+    expect(deleteSourceResponse.statusCode).toBe(204);
+
+    const specificAfterDeleteResponse = await app.inject({
+      method: 'GET',
+      url: specificCopyPath,
+      headers: signRequest({ method: 'GET', pathname: specificCopyPath, host }),
+    });
+    expect(specificAfterDeleteResponse.statusCode).toBe(200);
+    expect(specificAfterDeleteResponse.body).toBe('copy-version-one');
+
+    const currentAfterDeleteResponse = await app.inject({
+      method: 'GET',
+      url: `${currentCopyPath}?${copiedVersionQuery}`,
+      headers: signRequest({ method: 'GET', pathname: currentCopyPath, queryString: copiedVersionQuery, host }),
+    });
+    expect(currentAfterDeleteResponse.statusCode).toBe(200);
+    expect(currentAfterDeleteResponse.body).toBe('copy-version-two');
+  });
+
   it('keeps shared SQLite blob bodies readable after lifecycle pruning', async () => {
     const webdav = await startMemoryWebdav();
     webdavs.push(webdav);

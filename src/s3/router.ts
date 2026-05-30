@@ -570,13 +570,65 @@ async function handleDeleteObjects(ctx: S3RequestContext) {
   return sendXml(ctx, 200, deleteObjectsXml(deleted, errors));
 }
 
+interface CopySourceLocation {
+  bucket: string;
+  key: string;
+  versionId?: string;
+}
+
+function parseCopySourceHeader(sourceHeader: string): CopySourceLocation | null {
+  try {
+    const url = new URL(sourceHeader.startsWith('/') ? `http://s3.local${sourceHeader}` : `http://s3.local/${sourceHeader}`);
+    const sourcePath = url.pathname.replace(/^\//, '');
+    const parts = sourcePath.split('/');
+    const bucket = parts[0] ? decodeURIComponent(parts[0]) : '';
+    const key = parts.slice(1).map(decodeURIComponent).join('/');
+    if (!bucket || !key) return null;
+    return {
+      bucket,
+      key,
+      versionId: url.searchParams.get('versionId') ?? undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readCopySourceBody(params: {
+  blobStore: BlobStore;
+  state: MetadataStore;
+  bucketBinding: BucketBinding;
+  bucket: string;
+  key: string;
+  versionId?: string;
+  metadata: ObjectMetadataState | null;
+}): Promise<Buffer> {
+  if (params.metadata?.bodyPath) {
+    const resp = await params.blobStore.getRaw(params.metadata.bodyPath);
+    if (resp.statusCode === 404) throw new S3OperationError('NoSuchKey', 'The specified key does not exist.', 404);
+    if (resp.statusCode >= 400) throw new S3OperationError('InternalError', `Blob read failed: ${resp.statusCode}`, 500);
+    return resp.body;
+  }
+
+  if (params.versionId) {
+    const bodyPath = params.state.versionBodyPath(params.bucket, params.key, params.versionId);
+    const resp = await params.blobStore.getRaw(bodyPath);
+    if (resp.statusCode === 404) throw new S3OperationError('NoSuchVersion', 'The specified version does not exist.', 404);
+    if (resp.statusCode >= 400) throw new S3OperationError('InternalError', `Version body read failed: ${resp.statusCode}`, 500);
+    return resp.body;
+  }
+
+  return objectSemantics.readableToBuffer((await params.blobStore.getObject(params.bucketBinding, params.key)).body);
+}
+
 async function handleCopyObject(ctx: S3RequestContext) {
   const sourceHeader = ctx.headers['x-amz-copy-source'];
   if (!sourceHeader) return sendS3Error(ctx.reply, 'InvalidRequest', 'Missing x-amz-copy-source header', 400, ctx.requestId);
-  const sourcePath = sourceHeader.replace(/^\//, '');
-  const parts = sourcePath.split('/');
-  const sourceBucket = decodeURIComponent(parts[0]);
-  const sourceKey = parts.slice(1).map(decodeURIComponent).join('/');
+  const source = parseCopySourceHeader(sourceHeader);
+  if (!source) return sendS3Error(ctx.reply, 'InvalidArgument', 'Invalid x-amz-copy-source header', 400, ctx.requestId);
+
+  const sourceBucket = source.bucket;
+  const sourceKey = source.key;
   const sourceTenant = findTenantByBucket(ctx.registry, sourceBucket);
   const sourceBucketBinding = sourceTenant?.buckets.get(sourceBucket);
   const sourceUpstream = sourceBucketBinding ? sourceTenant?.upstreams.get(sourceBucketBinding.upstreamId) : undefined;
@@ -587,24 +639,45 @@ async function handleCopyObject(ctx: S3RequestContext) {
   const sourceBackend = sourceBucket === ctx.bucket!.name ? undefined : ctx.storageBackendFactory.getBackend(sourceUpstream);
   const sourceBlobStore = sourceBucket === ctx.bucket!.name ? ctx.blobStore! : sourceBackend!.blobStore;
   const sourceState = sourceBucket === ctx.bucket!.name ? ctx.state! : sourceBackend!.metadataStore;
-  const sourceMetadata = await sourceState.getObjectMetadata(sourceBucket, sourceKey);
+  const sourceMetadata = source.versionId
+    ? await sourceState.getObjectVersion(sourceBucket, sourceKey, source.versionId)
+    : await sourceState.getObjectMetadata(sourceBucket, sourceKey);
+  if (source.versionId && !sourceMetadata) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version does not exist.', 404, ctx.requestId);
+  if (sourceMetadata?.isDeleteMarker) return sendS3Error(ctx.reply, 'NoSuchKey', 'The specified key does not exist.', 404, ctx.requestId);
+
   const condition = objectSemantics.evaluateCopySourceConditions(ctx.headers, sourceMetadata);
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
+  const targetExisting = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+  if (objectSemantics.isObjectLocked(targetExisting)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
+
   let result: { etag: string; bodyPath?: string };
   let sourceSize = sourceMetadata?.size ?? 0;
+  let copiedBody: Buffer | undefined;
   if (sourceMetadata?.bodyPath && sourceBlobStore === ctx.blobStore && ctx.state!.listObjectMetadata) {
     result = { etag: sourceMetadata.etag, bodyPath: sourceMetadata.bodyPath };
     sourceSize = sourceMetadata.size;
   } else {
-    const sourceBody = sourceMetadata?.bodyPath
-      ? (await sourceBlobStore.getRaw(sourceMetadata.bodyPath)).body
-      : await objectSemantics.readableToBuffer((await sourceBlobStore.getObject(sourceBucketBinding, sourceKey)).body);
-    sourceSize = sourceBody.length;
-    result = await putObjectBody(ctx, ctx.key, sourceBody, sourceBody.length);
+    copiedBody = await readCopySourceBody({
+      blobStore: sourceBlobStore,
+      state: sourceState,
+      bucketBinding: sourceBucketBinding,
+      bucket: sourceBucket,
+      key: sourceKey,
+      versionId: source.versionId,
+      metadata: sourceMetadata,
+    });
+    sourceSize = copiedBody.length;
+    result = await putObjectBody(ctx, ctx.key, copiedBody, copiedBody.length);
   }
+
+  const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
+  const versionId = bucketState.versioning === 'Enabled' ? objectSemantics.createVersionId(ctx.bucketName!, ctx.key) : undefined;
   const directive = ctx.headers['x-amz-metadata-directive']?.toUpperCase();
   const taggingDirective = ctx.headers['x-amz-tagging-directive']?.toUpperCase();
+  const sourceForMetadata = sourceMetadata && directive !== 'REPLACE'
+    ? { ...sourceMetadata, versionId: undefined }
+    : undefined;
   const metadata = {
     ...objectSemantics.buildObjectMetadata({
       bucket: ctx.bucketName!,
@@ -613,12 +686,25 @@ async function handleCopyObject(ctx: S3RequestContext) {
       etag: result.etag,
       size: sourceSize,
       tagging: taggingDirective === 'REPLACE' ? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging']) : sourceMetadata?.tagging ?? {},
-      source: directive === 'REPLACE' ? undefined : sourceMetadata ?? undefined,
+      source: sourceForMetadata,
+      versionId,
     }),
     bodyPath: result.bodyPath,
   };
   await ctx.state!.putObjectMetadata(metadata);
-  return ctx.reply.status(200).headers(XML_HEADERS).send(copyObjectXml({ etag: result.etag, lastModified: metadata.lastModified }));
+  if (versionId) {
+    const bodyPath = result.bodyPath ?? ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
+    if (!result.bodyPath) {
+      if (!copiedBody) throw new S3OperationError('InternalError', 'Copied body is unavailable for version storage', 500);
+      await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
+      await ctx.blobStore!.putRaw(bodyPath, copiedBody, copiedBody.length);
+    }
+    await ctx.state!.putObjectVersion({ ...metadata, versionId, isLatest: true, bodyPath });
+  }
+  return ctx.reply
+    .status(200)
+    .headers({ ...XML_HEADERS, ...(versionId ? { 'x-amz-version-id': versionId } : {}), 'x-amz-request-id': ctx.requestId })
+    .send(copyObjectXml({ etag: result.etag, lastModified: metadata.lastModified }));
 }
 
 async function handleListObjects(ctx: S3RequestContext) {
