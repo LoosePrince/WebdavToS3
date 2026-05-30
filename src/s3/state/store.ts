@@ -38,6 +38,7 @@ export interface ObjectMetadataState {
   storageClass?: string;
   checksum?: Record<string, string>;
   versionId?: string;
+  bodyPath?: string;
   isDeleteMarker?: boolean;
   objectLock?: {
     mode?: string;
@@ -165,8 +166,20 @@ export class S3StateStore {
     const path = this.versionIndexPath(bucket);
     const index = await this.readJson<BucketVersionIndex>(path);
     if (!index) return;
+
     const entries = index.entries.filter((entry) => !(entry.key === key && entry.versionId === versionId));
-    await this.writeJson(path, { bucket, entries });
+    const promoted = entries.find((entry) => entry.key === key);
+    const normalizedEntries = entries.map((entry) => (
+      entry.key === key ? { ...entry, isLatest: entry.versionId === promoted?.versionId } : entry
+    ));
+    await this.writeJson(path, { bucket, entries: normalizedEntries });
+
+    if (promoted) {
+      const { isLatest: _isLatest, ...metadata } = promoted;
+      await this.putObjectMetadata(metadata);
+    } else {
+      await this.deleteObjectMetadata(bucket, key);
+    }
   }
 
   versionBodyPath(bucket: string, key: string, versionId: string): string {

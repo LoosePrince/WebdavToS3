@@ -214,6 +214,16 @@ function createApp(endpoint: string): FastifyInstance {
   return buildApp({ tenantRegistry: registry, adminKey: 'test-admin-key' });
 }
 
+function createSqliteApp(endpoint: string, metadataPath: string): FastifyInstance {
+  const registry = new TenantRegistry();
+  registry.add(createTenant(endpoint));
+  return buildApp({
+    tenantRegistry: registry,
+    adminKey: 'test-admin-key',
+    metadata: { driver: 'sqlite', path: metadataPath },
+  });
+}
+
 function createSessionTokenApp(endpoint: string): FastifyInstance {
   const registry = new TenantRegistry();
   registry.add({ ...createTenant(endpoint), sessionToken: SESSION_TOKEN });
@@ -496,10 +506,12 @@ ${responses}
 describe('S3 compatibility flows', () => {
   const apps: FastifyInstance[] = [];
   const webdavs: RunningWebdav[] = [];
+  const tempDirs: string[] = [];
 
   afterEach(async () => {
     await Promise.all(apps.splice(0).map((app) => app.close()));
     await Promise.all(webdavs.splice(0).map((webdav) => webdav.close()));
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
   it('accepts virtual-host-style bucket requests', async () => {
@@ -517,6 +529,77 @@ describe('S3 compatibility flows', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.headers['x-amz-bucket-region']).toBe(REGION);
+  });
+
+  it('stores new SQLite-indexed objects as WebDAV blobs', async () => {
+    const webdav = await startMemoryWebdav();
+    webdavs.push(webdav);
+    const tempDir = await mkdtemp(join(tmpdir(), 'webdavtos3-blob-backend-'));
+    tempDirs.push(tempDir);
+    const app = createSqliteApp(webdav.endpoint, join(tempDir, 'metadata.sqlite'));
+    apps.push(app);
+
+    const host = '127.0.0.1';
+    const pathname = '/uniid/blob-indexed.txt';
+    const body = Buffer.from('blob-indexed-body');
+    const putResponse = await app.inject({
+      method: 'PUT',
+      url: pathname,
+      payload: body,
+      headers: signRequest({
+        method: 'PUT',
+        pathname,
+        host,
+        payloadHash: createHash('sha256').update(body).digest('hex'),
+        extraHeaders: {
+          'content-length': String(body.length),
+          'content-type': 'text/plain',
+        },
+      }),
+    });
+    expect(putResponse.statusCode).toBe(200);
+
+    const directWebdavObject = await fetch(`${webdav.endpoint}${pathname}`);
+    expect(directWebdavObject.status).toBe(404);
+
+    const digest = createHash('sha256').update(body).digest('hex');
+    const blobPath = `/.webdavtos3-blobs/sha256/${digest.slice(0, 2)}/${digest.slice(2, 4)}/${digest}`;
+    const rawBlob = await fetch(`${webdav.endpoint}${blobPath}`);
+    expect(rawBlob.status).toBe(200);
+    expect(await rawBlob.text()).toBe('blob-indexed-body');
+
+    const getResponse = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(getResponse.statusCode).toBe(200);
+    expect(getResponse.headers['content-type']).toBe('text/plain');
+    expect(getResponse.body).toBe('blob-indexed-body');
+
+    const listQuery = 'prefix=blob-';
+    const listResponse = await app.inject({
+      method: 'GET',
+      url: `/uniid?${listQuery}`,
+      headers: signRequest({ method: 'GET', pathname: '/uniid', queryString: listQuery, host }),
+    });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listResponse.body).toContain('<Key>blob-indexed.txt</Key>');
+
+    const deleteResponse = await app.inject({
+      method: 'DELETE',
+      url: pathname,
+      headers: signRequest({ method: 'DELETE', pathname, host }),
+    });
+    expect(deleteResponse.statusCode).toBe(204);
+
+    const getAfterDelete = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(getAfterDelete.statusCode).toBe(404);
+    expect((await fetch(`${webdav.endpoint}${blobPath}`)).status).toBe(200);
   });
 
   it('uploads, lists, completes, and reads a multipart object', async () => {
@@ -996,14 +1079,51 @@ describe('S3 compatibility flows', () => {
     expect(listVersionsResponse.body).toContain(`<VersionId>${deleteMarkerVersionId}</VersionId>`);
     expect(listVersionsResponse.body).toContain('<DeleteMarker>');
 
-    const deleteSpecificVersionQuery = `versionId=${encodeURIComponent(firstVersionId)}`;
-    const deleteSpecificVersionResponse = await app.inject({
+    const deleteDeleteMarkerQuery = `versionId=${encodeURIComponent(deleteMarkerVersionId)}`;
+    const deleteDeleteMarkerResponse = await app.inject({
       method: 'DELETE',
-      url: `${pathname}?${deleteSpecificVersionQuery}`,
-      headers: signRequest({ method: 'DELETE', pathname, queryString: deleteSpecificVersionQuery, host }),
+      url: `${pathname}?${deleteDeleteMarkerQuery}`,
+      headers: signRequest({ method: 'DELETE', pathname, queryString: deleteDeleteMarkerQuery, host }),
     });
-    expect(deleteSpecificVersionResponse.statusCode).toBe(204);
-    expect(deleteSpecificVersionResponse.headers['x-amz-version-id']).toBe(firstVersionId);
+    expect(deleteDeleteMarkerResponse.statusCode).toBe(204);
+    expect(deleteDeleteMarkerResponse.headers['x-amz-delete-marker']).toBe('true');
+    expect(deleteDeleteMarkerResponse.headers['x-amz-version-id']).toBe(deleteMarkerVersionId);
+
+    const currentAfterMarkerDelete = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(currentAfterMarkerDelete.statusCode).toBe(200);
+    expect(currentAfterMarkerDelete.headers['x-amz-version-id']).toBe(secondVersionId);
+    expect(currentAfterMarkerDelete.body).toBe('version-two');
+
+    const deleteSecondVersionQuery = `versionId=${encodeURIComponent(secondVersionId)}`;
+    const deleteSecondVersionResponse = await app.inject({
+      method: 'DELETE',
+      url: `${pathname}?${deleteSecondVersionQuery}`,
+      headers: signRequest({ method: 'DELETE', pathname, queryString: deleteSecondVersionQuery, host }),
+    });
+    expect(deleteSecondVersionResponse.statusCode).toBe(204);
+    expect(deleteSecondVersionResponse.headers['x-amz-version-id']).toBe(secondVersionId);
+
+    const currentAfterSecondDelete = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(currentAfterSecondDelete.statusCode).toBe(200);
+    expect(currentAfterSecondDelete.headers['x-amz-version-id']).toBe(firstVersionId);
+    expect(currentAfterSecondDelete.body).toBe('version-one');
+
+    const deleteFirstVersionQuery = `versionId=${encodeURIComponent(firstVersionId)}`;
+    const deleteFirstVersionResponse = await app.inject({
+      method: 'DELETE',
+      url: `${pathname}?${deleteFirstVersionQuery}`,
+      headers: signRequest({ method: 'DELETE', pathname, queryString: deleteFirstVersionQuery, host }),
+    });
+    expect(deleteFirstVersionResponse.statusCode).toBe(204);
+    expect(deleteFirstVersionResponse.headers['x-amz-version-id']).toBe(firstVersionId);
 
     const readDeletedVersionResponse = await app.inject({
       method: 'GET',
@@ -1011,6 +1131,13 @@ describe('S3 compatibility flows', () => {
       headers: signRequest({ method: 'GET', pathname, queryString: readFirstVersionQuery, host }),
     });
     expect(readDeletedVersionResponse.statusCode).toBe(404);
+
+    const currentAfterAllVersionsDeleted = await app.inject({
+      method: 'GET',
+      url: pathname,
+      headers: signRequest({ method: 'GET', pathname, host }),
+    });
+    expect(currentAfterAllVersionsDeleted.statusCode).toBe(404);
   });
 
   it('blocks overwrite and delete when object legal hold or retention is active', async () => {

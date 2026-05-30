@@ -96,6 +96,18 @@ describe('SqliteMetadataStore', () => {
       ['v1', false],
     ]);
 
+    await store.putObjectMetadata(objectMetadata('versioned.txt', { versionId: 'v2', bodyPath: '/versions/v2' }));
+    await store.deleteObjectVersion('demo', 'versioned.txt', 'v2');
+    expect((await store.getObjectVersion('demo', 'versioned.txt', 'v1'))?.isLatest).toBe(true);
+    expect(await store.getObjectVersion('demo', 'versioned.txt', 'v2')).toBeNull();
+    expect(await store.getObjectMetadata('demo', 'versioned.txt')).toMatchObject({
+      versionId: 'v1',
+      bodyPath: '/versions/v1',
+    });
+
+    await store.deleteObjectVersion('demo', 'versioned.txt', 'v1');
+    expect(await store.getObjectMetadata('demo', 'versioned.txt')).toBeNull();
+
     const upload = await store.createMultipartUpload({
       bucket: 'demo',
       key: 'multipart.txt',

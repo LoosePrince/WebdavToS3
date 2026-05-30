@@ -23,7 +23,7 @@ export interface BlobStore {
       continuationToken?: string;
     },
   ): Promise<ListObjectsV2Result>;
-  getRaw(path: string): Promise<WebdavResponse>;
+  getRaw(path: string, rangeHeader?: string): Promise<WebdavResponse>;
   putRaw(path: string, body: NodeJS.ReadableStream | Buffer, contentLength?: number): Promise<WebdavResponse>;
   deleteRaw(path: string): Promise<WebdavResponse>;
   ensurePath(path: string): Promise<void>;
@@ -64,8 +64,9 @@ export class WebdavBlobStore implements BlobStore {
     return listObjectsV2(this.client, bucket, params);
   }
 
-  getRaw(path: string): Promise<WebdavResponse> {
-    return this.client.get(path);
+  getRaw(path: string, rangeHeader?: string): Promise<WebdavResponse> {
+    const headers = rangeHeader ? { range: rangeHeader } : undefined;
+    return this.client.request('GET', path, { headers });
   }
 
   putRaw(path: string, body: NodeJS.ReadableStream | Buffer, contentLength?: number): Promise<WebdavResponse> {

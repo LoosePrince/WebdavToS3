@@ -189,6 +189,15 @@ export function createWeakEtag(body: Buffer): string {
   return Math.abs(hash).toString(16).padStart(8, '0');
 }
 
+export function createContentEtag(body: Buffer): string {
+  return `"${createHash('md5').update(body).digest('hex')}"`;
+}
+
+export function contentAddressedBlobPath(body: Buffer): string {
+  const hash = createHash('sha256').update(body).digest('hex');
+  return `/.webdavtos3-blobs/sha256/${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}`;
+}
+
 export function createVersionId(bucket: string, key: string): string {
   return createHash('sha256').update(`${bucket}/${key}/${Date.now()}/${Math.random()}`).digest('hex');
 }

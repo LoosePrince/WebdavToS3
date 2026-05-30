@@ -317,6 +317,10 @@ async function handleGetObject(ctx: S3RequestContext) {
   if (condition.status === 304) return ctx.reply.status(304).header('x-amz-request-id', ctx.requestId).send();
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
+  if (metadata?.bodyPath) {
+    return await handleGetStoredObject(ctx, metadata);
+  }
+
   const result = await ctx.blobStore!.getObject(ctx.bucket!, ctx.key, ctx.headers['range']);
   const overrideHeaders = responseOverrideHeaders(ctx.query);
   return ctx.reply
@@ -337,6 +341,10 @@ async function handleHeadObject(ctx: S3RequestContext) {
   if (condition.status === 304) return ctx.reply.status(304).header('x-amz-request-id', ctx.requestId).send();
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
+  if (metadata?.bodyPath) {
+    return ctx.reply.status(200).headers({ ...objectSemantics.metadataHeaders(metadata), 'x-amz-request-id': ctx.requestId }).send();
+  }
+
   const result = await ctx.blobStore!.headObject(ctx.bucket!, ctx.key);
   return ctx.reply.status(result.statusCode).headers({ ...result.headers, ...objectSemantics.metadataHeaders(metadata), 'x-amz-request-id': ctx.requestId }).send();
 }
@@ -353,24 +361,29 @@ async function handlePutObject(ctx: S3RequestContext) {
   const condition = objectSemantics.evaluateObjectConditions(ctx.headers, existing?.isDeleteMarker ? null : existing);
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
-  const result = await ctx.blobStore!.putObject(ctx.bucket!, ctx.key, body, contentLength);
+  const result = await putObjectBody(ctx, ctx.key, body, contentLength);
   const versionId = bucketState.versioning === 'Enabled' ? objectSemantics.createVersionId(ctx.bucketName!, ctx.key) : undefined;
-  const metadata = objectSemantics.buildObjectMetadata({
-    bucket: ctx.bucketName!,
-    key: ctx.key,
-    headers: ctx.headers,
-    etag: result.etag,
-    size: body.length,
-    tagging: existing?.isDeleteMarker
-      ? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging'])
-      : existing?.tagging ?? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging']),
-    versionId,
-  });
+  const metadata = {
+    ...objectSemantics.buildObjectMetadata({
+      bucket: ctx.bucketName!,
+      key: ctx.key,
+      headers: ctx.headers,
+      etag: result.etag,
+      size: body.length,
+      tagging: existing?.isDeleteMarker
+        ? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging'])
+        : existing?.tagging ?? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging']),
+      versionId,
+    }),
+    bodyPath: result.bodyPath,
+  };
   await ctx.state!.putObjectMetadata(metadata);
   if (versionId) {
-    const bodyPath = ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
-    await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
-    await ctx.blobStore!.putRaw(bodyPath, body, body.length);
+    const bodyPath = result.bodyPath ?? ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
+    if (!result.bodyPath) {
+      await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
+      await ctx.blobStore!.putRaw(bodyPath, body, body.length);
+    }
     await ctx.state!.putObjectVersion({ ...metadata, versionId, isLatest: true, bodyPath });
   }
   return ctx.reply
@@ -381,21 +394,70 @@ async function handlePutObject(ctx: S3RequestContext) {
     .send();
 }
 
+interface PutObjectBodyResult {
+  etag: string;
+  bodyPath?: string;
+}
+
+async function putObjectBody(
+  ctx: S3RequestContext,
+  key: string,
+  body: Buffer,
+  contentLength?: number,
+): Promise<PutObjectBodyResult> {
+  if (!ctx.state!.listObjectMetadata) {
+    return ctx.blobStore!.putObject(ctx.bucket!, key, body, contentLength);
+  }
+
+  const bodyPath = objectSemantics.contentAddressedBlobPath(body);
+  await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
+  const resp = await ctx.blobStore!.putRaw(bodyPath, body, contentLength);
+  if (![200, 201, 204].includes(resp.statusCode)) {
+    throw new S3OperationError('InternalError', `Blob write failed: ${resp.statusCode}`, 500);
+  }
+  return { etag: objectSemantics.createContentEtag(body), bodyPath };
+}
+
+async function handleGetStoredObject(ctx: S3RequestContext, metadata: ObjectMetadataState) {
+  const resp = await ctx.blobStore!.getRaw(metadata.bodyPath!, ctx.headers['range']);
+  if (resp.statusCode === 404) return sendS3Error(ctx.reply, 'NoSuchKey', 'The specified key does not exist.', 404, ctx.requestId);
+  if (resp.statusCode >= 400) return sendS3Error(ctx.reply, 'InternalError', `Blob read failed: ${resp.statusCode}`, 500, ctx.requestId);
+
+  const overrideHeaders = responseOverrideHeaders(ctx.query);
+  const rawHeaders = rawBlobResponseHeaders(resp);
+  const statusCode = ctx.headers['range'] && resp.statusCode === 206 ? 206 : 200;
+  return ctx.reply
+    .status(statusCode)
+    .headers({ ...objectSemantics.metadataHeaders(metadata), ...rawHeaders, ...overrideHeaders, 'x-amz-request-id': ctx.requestId })
+    .send(resp.body);
+}
+
+function rawBlobResponseHeaders(resp: { headers: Record<string, string>; body: Buffer }): Record<string, string> {
+  return {
+    'content-length': resp.headers['content-length'] ?? String(resp.body.length),
+    ...(resp.headers['content-range'] ? { 'content-range': resp.headers['content-range'] } : {}),
+    ...(resp.headers['accept-ranges'] ? { 'accept-ranges': resp.headers['accept-ranges'] } : {}),
+  };
+}
+
 async function handlePostPolicyUpload(ctx: S3RequestContext) {
   const form = parsePostPolicyForm(ctx.req.body);
   const key = form.fields.key;
   if (!key) return sendS3Error(ctx.reply, 'InvalidArgument', 'POST policy upload requires key field', 400, ctx.requestId);
   if (!form.file) return sendS3Error(ctx.reply, 'InvalidArgument', 'POST policy upload requires file field', 400, ctx.requestId);
 
-  const result = await ctx.blobStore!.putObject(ctx.bucket!, key, form.file.body, form.file.body.length);
-  await ctx.state!.putObjectMetadata(objectSemantics.buildObjectMetadata({
-    bucket: ctx.bucketName!,
-    key,
-    headers: ctx.headers,
-    etag: result.etag,
-    size: form.file.body.length,
-    tagging: objectSemantics.parseTaggingHeader(form.fields.tagging),
-  }));
+  const result = await putObjectBody(ctx, key, form.file.body, form.file.body.length);
+  await ctx.state!.putObjectMetadata({
+    ...objectSemantics.buildObjectMetadata({
+      bucket: ctx.bucketName!,
+      key,
+      headers: ctx.headers,
+      etag: result.etag,
+      size: form.file.body.length,
+      tagging: objectSemantics.parseTaggingHeader(form.fields.tagging),
+    }),
+    bodyPath: result.bodyPath,
+  });
   const status = form.fields.success_action_status ? Number(form.fields.success_action_status) : 204;
   if (status === 201) {
     return sendXml(ctx, 201, postPolicyUploadXml(ctx.bucketName!, key, result.etag));
@@ -406,8 +468,23 @@ async function handlePostPolicyUpload(ctx: S3RequestContext) {
 async function handleDeleteObject(ctx: S3RequestContext) {
   const versionId = ctx.query.versionId;
   if (versionId) {
+    const version = await ctx.state!.getObjectVersion(ctx.bucketName!, ctx.key, versionId);
+    if (objectSemantics.isObjectLocked(version)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
+
     await ctx.state!.deleteObjectVersion(ctx.bucketName!, ctx.key, versionId);
-    return ctx.reply.status(204).header('x-amz-version-id', versionId).header('x-amz-request-id', ctx.requestId).send();
+    const current = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
+    if (version && !current && !ctx.state!.listObjectMetadata) {
+      await ctx.blobStore!.deleteObject(ctx.bucket!, ctx.key);
+    }
+
+    return ctx.reply
+      .status(204)
+      .headers({
+        ...(version?.isDeleteMarker ? { 'x-amz-delete-marker': 'true' } : {}),
+        'x-amz-version-id': versionId,
+        'x-amz-request-id': ctx.requestId,
+      })
+      .send();
   }
 
   const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
@@ -438,7 +515,9 @@ async function handleDeleteObject(ctx: S3RequestContext) {
       .send();
   }
 
-  await ctx.blobStore!.deleteObject(ctx.bucket!, ctx.key);
+  if (!existing?.bodyPath) {
+    await ctx.blobStore!.deleteObject(ctx.bucket!, ctx.key);
+  }
   await ctx.state!.deleteObjectMetadata(ctx.bucketName!, ctx.key);
   return ctx.reply.status(204).header('x-amz-request-id', ctx.requestId).send();
 }
@@ -478,7 +557,9 @@ async function handleDeleteObjects(ctx: S3RequestContext) {
     }
 
     try {
-      await ctx.blobStore!.deleteObject(ctx.bucket!, key);
+      if (!existing?.bodyPath) {
+        await ctx.blobStore!.deleteObject(ctx.bucket!, key);
+      }
       await ctx.state!.deleteObjectMetadata(ctx.bucketName!, key);
       deleted.push({ key });
     } catch (err) {
@@ -510,20 +591,32 @@ async function handleCopyObject(ctx: S3RequestContext) {
   const condition = objectSemantics.evaluateCopySourceConditions(ctx.headers, sourceMetadata);
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
-  const sourceObject = await sourceBlobStore.getObject(sourceBucketBinding, sourceKey);
-  const sourceBody = await objectSemantics.readableToBuffer(sourceObject.body);
-  const result = await ctx.blobStore!.putObject(ctx.bucket!, ctx.key, sourceBody, sourceBody.length);
+  let result: { etag: string; bodyPath?: string };
+  let sourceSize = sourceMetadata?.size ?? 0;
+  if (sourceMetadata?.bodyPath && sourceBlobStore === ctx.blobStore && ctx.state!.listObjectMetadata) {
+    result = { etag: sourceMetadata.etag, bodyPath: sourceMetadata.bodyPath };
+    sourceSize = sourceMetadata.size;
+  } else {
+    const sourceBody = sourceMetadata?.bodyPath
+      ? (await sourceBlobStore.getRaw(sourceMetadata.bodyPath)).body
+      : await objectSemantics.readableToBuffer((await sourceBlobStore.getObject(sourceBucketBinding, sourceKey)).body);
+    sourceSize = sourceBody.length;
+    result = await putObjectBody(ctx, ctx.key, sourceBody, sourceBody.length);
+  }
   const directive = ctx.headers['x-amz-metadata-directive']?.toUpperCase();
   const taggingDirective = ctx.headers['x-amz-tagging-directive']?.toUpperCase();
-  const metadata = objectSemantics.buildObjectMetadata({
-    bucket: ctx.bucketName!,
-    key: ctx.key,
-    headers: ctx.headers,
-    etag: result.etag,
-    size: sourceBody.length,
-    tagging: taggingDirective === 'REPLACE' ? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging']) : sourceMetadata?.tagging ?? {},
-    source: directive === 'REPLACE' ? undefined : sourceMetadata ?? undefined,
-  });
+  const metadata = {
+    ...objectSemantics.buildObjectMetadata({
+      bucket: ctx.bucketName!,
+      key: ctx.key,
+      headers: ctx.headers,
+      etag: result.etag,
+      size: sourceSize,
+      tagging: taggingDirective === 'REPLACE' ? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging']) : sourceMetadata?.tagging ?? {},
+      source: directive === 'REPLACE' ? undefined : sourceMetadata ?? undefined,
+    }),
+    bodyPath: result.bodyPath,
+  };
   await ctx.state!.putObjectMetadata(metadata);
   return ctx.reply.status(200).headers(XML_HEADERS).send(copyObjectXml({ etag: result.etag, lastModified: metadata.lastModified }));
 }
@@ -562,12 +655,14 @@ async function handleGetObjectVersion(ctx: S3RequestContext, versionId: string) 
       .headers({ ...objectSemantics.metadataHeaders(version), 'x-amz-delete-marker': 'true', 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
       .send();
   }
-  if (!version.bodyPath) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version body does not exist.', 404, ctx.requestId);
-  const resp = await ctx.blobStore!.getRaw(version.bodyPath);
+  const bodyPath = version.bodyPath ?? ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
+  const resp = await ctx.blobStore!.getRaw(bodyPath, ctx.headers['range']);
   if (resp.statusCode >= 400) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version body does not exist.', 404, ctx.requestId);
+  const rawHeaders = rawBlobResponseHeaders(resp);
+  const statusCode = ctx.headers['range'] && resp.statusCode === 206 ? 206 : 200;
   return ctx.reply
-    .status(200)
-    .headers({ ...objectSemantics.metadataHeaders(version), 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+    .status(statusCode)
+    .headers({ ...objectSemantics.metadataHeaders(version), ...rawHeaders, 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
     .send(resp.body);
 }
 
@@ -767,7 +862,7 @@ async function handleCompleteMultipartUpload(ctx: S3RequestContext) {
     buffers.push(resp.body);
   }
   const finalBody = Buffer.concat(buffers);
-  const result = await ctx.blobStore!.putObject(ctx.bucket!, ctx.key, finalBody, finalBody.length);
+  const result = await putObjectBody(ctx, ctx.key, finalBody, finalBody.length);
   const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
   const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
   const versionId = bucketState.versioning === 'Enabled' ? objectSemantics.createVersionId(ctx.bucketName!, ctx.key) : undefined;
@@ -781,12 +876,15 @@ async function handleCompleteMultipartUpload(ctx: S3RequestContext) {
     userMetadata: state.metadata ?? {},
     tagging: existing?.isDeleteMarker ? {} : existing?.tagging ?? {},
     versionId,
+    bodyPath: result.bodyPath,
   };
   await ctx.state!.putObjectMetadata(metadata);
   if (versionId) {
-    const bodyPath = ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
-    await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
-    await ctx.blobStore!.putRaw(bodyPath, finalBody, finalBody.length);
+    const bodyPath = result.bodyPath ?? ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
+    if (!result.bodyPath) {
+      await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
+      await ctx.blobStore!.putRaw(bodyPath, finalBody, finalBody.length);
+    }
     await ctx.state!.putObjectVersion({ ...metadata, versionId, isLatest: true, bodyPath });
   }
   await ctx.state!.deleteMultipartUpload(ctx.bucketName!, uploadId);

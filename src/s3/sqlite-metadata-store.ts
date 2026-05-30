@@ -45,6 +45,10 @@ interface ObjectVersionRow extends JsonRow {
   body_path: string | null;
 }
 
+interface ObjectVersionRecordRow extends ObjectVersionRow {
+  id: number;
+}
+
 export class SqliteMetadataStore implements MetadataStore {
   private readonly db: DatabaseSyncType;
 
@@ -327,7 +331,48 @@ export class SqliteMetadataStore implements MetadataStore {
   }
 
   async deleteObjectVersion(bucket: string, key: string, versionId: string): Promise<void> {
-    this.db.prepare('DELETE FROM object_versions WHERE bucket = ? AND object_key = ? AND version_id = ?').run(bucket, key, versionId);
+    const target = this.db.prepare(`
+      SELECT id, state_json, is_latest, is_delete_marker, body_path
+      FROM object_versions
+      WHERE bucket = ? AND object_key = ? AND version_id = ?
+    `).get(bucket, key, versionId) as ObjectVersionRecordRow | undefined;
+    if (!target) return;
+
+    const deleteVersion = this.db.prepare('DELETE FROM object_versions WHERE bucket = ? AND object_key = ? AND version_id = ?');
+    const findPromoted = this.db.prepare(`
+      SELECT id, state_json, is_latest, is_delete_marker, body_path
+      FROM object_versions
+      WHERE bucket = ? AND object_key = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `);
+    const markNonLatest = this.db.prepare('UPDATE object_versions SET is_latest = 0 WHERE bucket = ? AND object_key = ?');
+    const markLatest = this.db.prepare('UPDATE object_versions SET is_latest = 1 WHERE id = ?');
+    const deleteCurrent = this.db.prepare('DELETE FROM object_metadata WHERE bucket = ? AND object_key = ?');
+    const upsertCurrent = this.db.prepare(`
+      INSERT INTO object_metadata (bucket, object_key, state_json, last_modified, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(bucket, object_key) DO UPDATE SET
+        state_json = excluded.state_json,
+        last_modified = excluded.last_modified,
+        updated_at = excluded.updated_at
+    `);
+
+    this.withTransaction(() => {
+      deleteVersion.run(bucket, key, versionId);
+      const promotedRow = findPromoted.get(bucket, key) as ObjectVersionRecordRow | undefined;
+      markNonLatest.run(bucket, key);
+
+      if (!promotedRow) {
+        deleteCurrent.run(bucket, key);
+        return;
+      }
+
+      markLatest.run(promotedRow.id);
+      const promoted = parseObjectVersionRow({ ...promotedRow, is_latest: 1 });
+      const { isLatest: _isLatest, ...metadata } = promoted;
+      upsertCurrent.run(bucket, key, stringifyJson(metadata), metadata.lastModified, new Date().toISOString());
+    });
   }
 
   private queryObjectMetadataRows(bucket: string, prefix: string): JsonRow[] {
