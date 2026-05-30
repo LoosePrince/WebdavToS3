@@ -7,18 +7,9 @@ import {
   extractPostPolicyAccessKey,
 } from './auth/sigv4.js';
 import { TenantRegistry, type BucketBinding, type Tenant } from '../tenancy/tenant-registry.js';
-import { WebdavClient } from '../webdav/client.js';
 import { parsePathStyleUrl } from '../utils/path-mapper.js';
 import { S3ErrorResponse } from './errors.js';
-import {
-  getObject,
-  putObject,
-  headObject,
-  deleteObject,
-  listObjectsV2,
-  listBuckets,
-  S3OperationError,
-} from './operations/index.js';
+import { listBuckets, S3OperationError } from './operations/index.js';
 import {
   listBucketsXml,
   listObjectsV2Xml,
@@ -28,7 +19,16 @@ import {
   escapeXml,
 } from './xml/serializer.js';
 import { getRequestId } from '../observability/request-context.js';
-import { S3StateStore, type BucketState, type MultipartUploadState, type ObjectMetadataState, type ObjectVersionState } from './state/store.js';
+import type { BlobStore } from './blob-store.js';
+import {
+  type BucketState,
+  type MetadataStore,
+  type MultipartUploadState,
+  type ObjectMetadataState,
+  type ObjectVersionState,
+} from './metadata-store.js';
+import * as objectSemantics from './object-semantics.js';
+import { createWebdavStorageBackend } from './storage-backend.js';
 
 interface AuthResult {
   ok: boolean;
@@ -51,8 +51,8 @@ interface S3RequestContext {
   key: string;
   ownerTenant?: Tenant;
   bucket?: BucketBinding;
-  client?: WebdavClient;
-  state?: S3StateStore;
+  blobStore?: BlobStore;
+  state?: MetadataStore;
 }
 
 export async function handleS3Request(
@@ -218,16 +218,7 @@ function buildContext(req: FastifyRequest, reply: FastifyReply, registry: Tenant
   const ownerTenant = bucketName ? findTenantByBucket(registry, bucketName) : undefined;
   const bucket = bucketName ? ownerTenant?.buckets.get(bucketName) : undefined;
   const upstream = bucket ? ownerTenant?.upstreams.get(bucket.upstreamId) : undefined;
-  const client = upstream
-    ? new WebdavClient({
-        endpoint: upstream.endpoint,
-        username: upstream.username,
-        password: upstream.password,
-        rejectUnauthorized: upstream.rejectUnauthorized,
-        connectTimeoutMs: upstream.connectTimeoutMs,
-        requestTimeoutMs: upstream.requestTimeoutMs,
-      })
-    : undefined;
+  const backend = upstream ? createWebdavStorageBackend(upstream) : undefined;
 
   return {
     req,
@@ -243,8 +234,8 @@ function buildContext(req: FastifyRequest, reply: FastifyReply, registry: Tenant
     key: parsed?.key ?? '',
     ownerTenant,
     bucket,
-    client,
-    state: client ? new S3StateStore(client) : undefined,
+    blobStore: backend?.blobStore,
+    state: backend?.metadataStore,
   };
 }
 
@@ -314,15 +305,15 @@ async function handleGetObject(ctx: S3RequestContext) {
   if (metadata?.isDeleteMarker) {
     return sendS3Error(ctx.reply, 'NoSuchKey', 'The specified key does not exist.', 404, ctx.requestId);
   }
-  const condition = evaluateObjectConditions(ctx.headers, metadata);
+  const condition = objectSemantics.evaluateObjectConditions(ctx.headers, metadata);
   if (condition.status === 304) return ctx.reply.status(304).header('x-amz-request-id', ctx.requestId).send();
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
-  const result = await getObject(ctx.client!, ctx.bucket!, ctx.key, ctx.headers['range']);
+  const result = await ctx.blobStore!.getObject(ctx.bucket!, ctx.key, ctx.headers['range']);
   const overrideHeaders = responseOverrideHeaders(ctx.query);
   return ctx.reply
     .status(result.statusCode)
-    .headers({ ...result.headers, ...metadataHeaders(metadata), ...overrideHeaders, 'x-amz-request-id': ctx.requestId })
+    .headers({ ...result.headers, ...objectSemantics.metadataHeaders(metadata), ...overrideHeaders, 'x-amz-request-id': ctx.requestId })
     .send(result.body);
 }
 
@@ -334,34 +325,44 @@ async function handleHeadObject(ctx: S3RequestContext) {
   if (metadata?.isDeleteMarker) {
     return sendS3Error(ctx.reply, 'NoSuchKey', 'The specified key does not exist.', 404, ctx.requestId);
   }
-  const condition = evaluateObjectConditions(ctx.headers, metadata);
+  const condition = objectSemantics.evaluateObjectConditions(ctx.headers, metadata);
   if (condition.status === 304) return ctx.reply.status(304).header('x-amz-request-id', ctx.requestId).send();
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
-  const result = await headObject(ctx.client!, ctx.bucket!, ctx.key);
-  return ctx.reply.status(result.statusCode).headers({ ...result.headers, ...metadataHeaders(metadata), 'x-amz-request-id': ctx.requestId }).send();
+  const result = await ctx.blobStore!.headObject(ctx.bucket!, ctx.key);
+  return ctx.reply.status(result.statusCode).headers({ ...result.headers, ...objectSemantics.metadataHeaders(metadata), 'x-amz-request-id': ctx.requestId }).send();
 }
 
 async function handlePutObject(ctx: S3RequestContext) {
-  const body = decodeStreamingPayloadIfNeeded(ctx.headers, ctx.req.body);
+  const body = objectSemantics.decodeStreamingPayloadIfNeeded(ctx.headers, ctx.req.body);
   const contentLength = body.length || (ctx.headers['content-length'] ? parseInt(ctx.headers['content-length'], 10) : undefined);
-  const checksumError = validateChecksums(ctx.headers, body);
+  const checksumError = objectSemantics.validateChecksums(ctx.headers, body);
   if (checksumError) return sendS3Error(ctx.reply, checksumError.code, checksumError.message, 400, ctx.requestId);
 
   const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
   const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
-  if (isObjectLocked(existing)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
-  const condition = evaluateObjectConditions(ctx.headers, existing?.isDeleteMarker ? null : existing);
+  if (objectSemantics.isObjectLocked(existing)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
+  const condition = objectSemantics.evaluateObjectConditions(ctx.headers, existing?.isDeleteMarker ? null : existing);
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
-  const result = await putObject(ctx.client!, ctx.bucket!, ctx.key, body, contentLength);
-  const versionId = bucketState.versioning === 'Enabled' ? createVersionId(ctx.bucketName!, ctx.key) : undefined;
-  const metadata = buildObjectMetadata(ctx, result.etag, body.length, existing?.isDeleteMarker ? parseTaggingHeader(ctx.headers['x-amz-tagging']) : existing?.tagging ?? parseTaggingHeader(ctx.headers['x-amz-tagging']), undefined, versionId);
+  const result = await ctx.blobStore!.putObject(ctx.bucket!, ctx.key, body, contentLength);
+  const versionId = bucketState.versioning === 'Enabled' ? objectSemantics.createVersionId(ctx.bucketName!, ctx.key) : undefined;
+  const metadata = objectSemantics.buildObjectMetadata({
+    bucket: ctx.bucketName!,
+    key: ctx.key,
+    headers: ctx.headers,
+    etag: result.etag,
+    size: body.length,
+    tagging: existing?.isDeleteMarker
+      ? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging'])
+      : existing?.tagging ?? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging']),
+    versionId,
+  });
   await ctx.state!.putObjectMetadata(metadata);
   if (versionId) {
     const bodyPath = ctx.state!.versionBodyPath(ctx.bucketName!, ctx.key, versionId);
-    await ctx.client!.ensureCollection(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
-    await ctx.client!.put(bodyPath, body, body.length);
+    await ctx.blobStore!.ensurePath(bodyPath.slice(0, bodyPath.lastIndexOf('/')));
+    await ctx.blobStore!.putRaw(bodyPath, body, body.length);
     await ctx.state!.putObjectVersion({ ...metadata, versionId, isLatest: true, bodyPath });
   }
   return ctx.reply
@@ -378,8 +379,15 @@ async function handlePostPolicyUpload(ctx: S3RequestContext) {
   if (!key) return sendS3Error(ctx.reply, 'InvalidArgument', 'POST policy upload requires key field', 400, ctx.requestId);
   if (!form.file) return sendS3Error(ctx.reply, 'InvalidArgument', 'POST policy upload requires file field', 400, ctx.requestId);
 
-  const result = await putObject(ctx.client!, ctx.bucket!, key, form.file.body, form.file.body.length);
-  await ctx.state!.putObjectMetadata(buildObjectMetadata({ ...ctx, key }, result.etag, form.file.body.length, parseTaggingHeader(form.fields.tagging)));
+  const result = await ctx.blobStore!.putObject(ctx.bucket!, key, form.file.body, form.file.body.length);
+  await ctx.state!.putObjectMetadata(objectSemantics.buildObjectMetadata({
+    bucket: ctx.bucketName!,
+    key,
+    headers: ctx.headers,
+    etag: result.etag,
+    size: form.file.body.length,
+    tagging: objectSemantics.parseTaggingHeader(form.fields.tagging),
+  }));
   const status = form.fields.success_action_status ? Number(form.fields.success_action_status) : 204;
   if (status === 201) {
     return sendXml(ctx, 201, postPolicyUploadXml(ctx.bucketName!, key, result.etag));
@@ -396,9 +404,9 @@ async function handleDeleteObject(ctx: S3RequestContext) {
 
   const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
   const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
-  if (isObjectLocked(existing)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
+  if (objectSemantics.isObjectLocked(existing)) return sendS3Error(ctx.reply, 'AccessDenied', 'Object is protected by Object Lock', 403, ctx.requestId);
   if (bucketState.versioning === 'Enabled') {
-    const deleteMarkerVersionId = createVersionId(ctx.bucketName!, `${ctx.key}:delete`);
+    const deleteMarkerVersionId = objectSemantics.createVersionId(ctx.bucketName!, `${ctx.key}:delete`);
     const marker: ObjectVersionState = {
       bucket: ctx.bucketName!,
       key: ctx.key,
@@ -422,26 +430,26 @@ async function handleDeleteObject(ctx: S3RequestContext) {
       .send();
   }
 
-  await deleteObject(ctx.client!, ctx.bucket!, ctx.key);
+  await ctx.blobStore!.deleteObject(ctx.bucket!, ctx.key);
   await ctx.state!.deleteObjectMetadata(ctx.bucketName!, ctx.key);
   return ctx.reply.status(204).header('x-amz-request-id', ctx.requestId).send();
 }
 
 async function handleDeleteObjects(ctx: S3RequestContext) {
-  const keys = parseDeleteObjectsBody(await requestBodyText(ctx.req.body));
+  const keys = objectSemantics.parseDeleteObjectsBody(await objectSemantics.requestBodyText(ctx.req.body));
   const bucketState = await ctx.state!.getBucketState(ctx.bucketName!);
   const deleted: Array<{ key: string; versionId?: string; deleteMarker?: boolean }> = [];
   const errors: Array<{ key: string; code: string; message: string }> = [];
 
   for (const key of keys) {
     const existing = await ctx.state!.getObjectMetadata(ctx.bucketName!, key);
-    if (isObjectLocked(existing)) {
+    if (objectSemantics.isObjectLocked(existing)) {
       errors.push({ key, code: 'AccessDenied', message: 'Object is protected by Object Lock' });
       continue;
     }
 
     if (bucketState.versioning === 'Enabled') {
-      const deleteMarkerVersionId = createVersionId(ctx.bucketName!, `${key}:delete`);
+      const deleteMarkerVersionId = objectSemantics.createVersionId(ctx.bucketName!, `${key}:delete`);
       const marker: ObjectVersionState = {
         bucket: ctx.bucketName!,
         key,
@@ -462,7 +470,7 @@ async function handleDeleteObjects(ctx: S3RequestContext) {
     }
 
     try {
-      await deleteObject(ctx.client!, ctx.bucket!, key);
+      await ctx.blobStore!.deleteObject(ctx.bucket!, key);
       await ctx.state!.deleteObjectMetadata(ctx.bucketName!, key);
       deleted.push({ key });
     } catch (err) {
@@ -487,39 +495,33 @@ async function handleCopyObject(ctx: S3RequestContext) {
     return sendS3Error(ctx.reply, 'NoSuchBucket', 'The source bucket does not exist', 404, ctx.requestId);
   }
 
-  const sourceClient = sourceBucket === ctx.bucket!.name
-    ? ctx.client!
-    : new WebdavClient({
-        endpoint: sourceUpstream.endpoint,
-        username: sourceUpstream.username,
-        password: sourceUpstream.password,
-        rejectUnauthorized: sourceUpstream.rejectUnauthorized,
-        connectTimeoutMs: sourceUpstream.connectTimeoutMs,
-        requestTimeoutMs: sourceUpstream.requestTimeoutMs,
-      });
-  const sourceState = sourceBucket === ctx.bucket!.name ? ctx.state! : new S3StateStore(sourceClient);
+  const sourceBackend = sourceBucket === ctx.bucket!.name ? undefined : createWebdavStorageBackend(sourceUpstream);
+  const sourceBlobStore = sourceBucket === ctx.bucket!.name ? ctx.blobStore! : sourceBackend!.blobStore;
+  const sourceState = sourceBucket === ctx.bucket!.name ? ctx.state! : sourceBackend!.metadataStore;
   const sourceMetadata = await sourceState.getObjectMetadata(sourceBucket, sourceKey);
-  const condition = evaluateCopySourceConditions(ctx.headers, sourceMetadata);
+  const condition = objectSemantics.evaluateCopySourceConditions(ctx.headers, sourceMetadata);
   if (condition.status === 412) return sendS3Error(ctx.reply, 'PreconditionFailed', 'At least one of the preconditions you specified did not hold', 412, ctx.requestId);
 
-  const sourceObject = await getObject(sourceClient, sourceBucketBinding, sourceKey);
-  const sourceBody = await readableToBuffer(sourceObject.body);
-  const result = await putObject(ctx.client!, ctx.bucket!, ctx.key, sourceBody, sourceBody.length);
+  const sourceObject = await sourceBlobStore.getObject(sourceBucketBinding, sourceKey);
+  const sourceBody = await objectSemantics.readableToBuffer(sourceObject.body);
+  const result = await ctx.blobStore!.putObject(ctx.bucket!, ctx.key, sourceBody, sourceBody.length);
   const directive = ctx.headers['x-amz-metadata-directive']?.toUpperCase();
   const taggingDirective = ctx.headers['x-amz-tagging-directive']?.toUpperCase();
-  const metadata = buildObjectMetadata(
-    ctx,
-    result.etag,
-    sourceBody.length,
-    taggingDirective === 'REPLACE' ? parseTaggingHeader(ctx.headers['x-amz-tagging']) : sourceMetadata?.tagging ?? {},
-    directive === 'REPLACE' ? undefined : sourceMetadata ?? undefined,
-  );
+  const metadata = objectSemantics.buildObjectMetadata({
+    bucket: ctx.bucketName!,
+    key: ctx.key,
+    headers: ctx.headers,
+    etag: result.etag,
+    size: sourceBody.length,
+    tagging: taggingDirective === 'REPLACE' ? objectSemantics.parseTaggingHeader(ctx.headers['x-amz-tagging']) : sourceMetadata?.tagging ?? {},
+    source: directive === 'REPLACE' ? undefined : sourceMetadata ?? undefined,
+  });
   await ctx.state!.putObjectMetadata(metadata);
   return ctx.reply.status(200).headers(XML_HEADERS).send(copyObjectXml({ etag: result.etag, lastModified: metadata.lastModified }));
 }
 
 async function handleListObjects(ctx: S3RequestContext) {
-  const result = await listObjectsV2(ctx.client!, ctx.bucket!, {
+  const result = await ctx.blobStore!.listObjects(ctx.bucket!, {
     prefix: ctx.query.prefix,
     delimiter: ctx.query.delimiter,
     maxKeys: ctx.query['max-keys'] ? parseInt(ctx.query['max-keys'], 10) : undefined,
@@ -539,15 +541,15 @@ async function handleGetObjectVersion(ctx: S3RequestContext, versionId: string) 
   if (version.isDeleteMarker) {
     return ctx.reply
       .status(405)
-      .headers({ ...metadataHeaders(version), 'x-amz-delete-marker': 'true', 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+      .headers({ ...objectSemantics.metadataHeaders(version), 'x-amz-delete-marker': 'true', 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
       .send();
   }
   if (!version.bodyPath) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version body does not exist.', 404, ctx.requestId);
-  const resp = await ctx.client!.get(version.bodyPath);
+  const resp = await ctx.blobStore!.getRaw(version.bodyPath);
   if (resp.statusCode >= 400) return sendS3Error(ctx.reply, 'NoSuchVersion', 'The specified version body does not exist.', 404, ctx.requestId);
   return ctx.reply
     .status(200)
-    .headers({ ...metadataHeaders(version), 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+    .headers({ ...objectSemantics.metadataHeaders(version), 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
     .send(resp.body);
 }
 
@@ -557,12 +559,12 @@ async function handleHeadObjectVersion(ctx: S3RequestContext, versionId: string)
   if (version.isDeleteMarker) {
     return ctx.reply
       .status(405)
-      .headers({ ...metadataHeaders(version), 'x-amz-delete-marker': 'true', 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+      .headers({ ...objectSemantics.metadataHeaders(version), 'x-amz-delete-marker': 'true', 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
       .send();
   }
   return ctx.reply
     .status(200)
-    .headers({ ...metadataHeaders(version), 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
+    .headers({ ...objectSemantics.metadataHeaders(version), 'x-amz-version-id': version.versionId, 'x-amz-request-id': ctx.requestId })
     .send();
 }
 
@@ -585,7 +587,7 @@ async function handleGetBucketVersioning(ctx: S3RequestContext) {
 
 async function handlePutBucketVersioning(ctx: S3RequestContext) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
-  const body = await requestBodyText(ctx.req.body);
+  const body = await objectSemantics.requestBodyText(ctx.req.body);
   state.versioning = body.includes('<Status>Enabled</Status>') ? 'Enabled' : body.includes('<Status>Suspended</Status>') ? 'Suspended' : state.versioning;
   await ctx.state!.putBucketState(state);
   return sendEmpty(ctx, 200);
@@ -600,15 +602,15 @@ async function handleGetJsonControl(ctx: S3RequestContext, key: keyof BucketStat
 
 async function handlePutJsonControl(ctx: S3RequestContext, key: keyof BucketState) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
-  const body = await requestBodyText(ctx.req.body);
-  (state as unknown as Record<string, unknown>)[key] = body ? safeJsonParse(body) ?? body : {};
+  const body = await objectSemantics.requestBodyText(ctx.req.body);
+  (state as unknown as Record<string, unknown>)[key] = body ? objectSemantics.safeJsonParse(body) ?? body : {};
   await ctx.state!.putBucketState(state);
   return sendEmpty(ctx, 200);
 }
 
 async function handlePutXmlControl(ctx: S3RequestContext, key: keyof BucketState) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
-  (state as unknown as Record<string, unknown>)[key] = await requestBodyText(ctx.req.body);
+  (state as unknown as Record<string, unknown>)[key] = await objectSemantics.requestBodyText(ctx.req.body);
   await ctx.state!.putBucketState(state);
   return sendEmpty(ctx, 200);
 }
@@ -634,7 +636,7 @@ async function handleGetBucketTagging(ctx: S3RequestContext) {
 
 async function handlePutBucketTagging(ctx: S3RequestContext) {
   const state = await ctx.state!.getBucketState(ctx.bucketName!);
-  state.tagging = parseTaggingXml(await requestBodyText(ctx.req.body));
+  state.tagging = objectSemantics.parseTaggingXml(await objectSemantics.requestBodyText(ctx.req.body));
   await ctx.state!.putBucketState(state);
   return sendEmpty(ctx, 200);
 }
@@ -647,7 +649,7 @@ async function handleGetObjectTagging(ctx: S3RequestContext) {
 async function handlePutObjectTagging(ctx: S3RequestContext) {
   const metadata = await requireObjectMetadata(ctx);
   if (!metadata) return;
-  metadata.tagging = parseTaggingXml(await requestBodyText(ctx.req.body));
+  metadata.tagging = objectSemantics.parseTaggingXml(await objectSemantics.requestBodyText(ctx.req.body));
   await ctx.state!.putObjectMetadata(metadata);
   return sendEmpty(ctx, 200);
 }
@@ -669,7 +671,7 @@ async function handleGetObjectLegalHold(ctx: S3RequestContext) {
 async function handlePutObjectLegalHold(ctx: S3RequestContext) {
   const metadata = await requireObjectMetadata(ctx);
   if (!metadata) return;
-  const body = await requestBodyText(ctx.req.body);
+  const body = await objectSemantics.requestBodyText(ctx.req.body);
   metadata.objectLock = {
     ...(metadata.objectLock ?? {}),
     legalHold: body.includes('<Status>ON</Status>') ? 'ON' : 'OFF',
@@ -687,11 +689,11 @@ async function handleGetObjectRetention(ctx: S3RequestContext) {
 async function handlePutObjectRetention(ctx: S3RequestContext) {
   const metadata = await requireObjectMetadata(ctx);
   if (!metadata) return;
-  const body = await requestBodyText(ctx.req.body);
+  const body = await objectSemantics.requestBodyText(ctx.req.body);
   metadata.objectLock = {
     ...(metadata.objectLock ?? {}),
-    mode: extractXmlValue(body, 'Mode') ?? metadata.objectLock?.mode ?? 'GOVERNANCE',
-    retainUntilDate: extractXmlValue(body, 'RetainUntilDate') ?? metadata.objectLock?.retainUntilDate,
+    mode: objectSemantics.extractXmlValue(body, 'Mode') ?? metadata.objectLock?.mode ?? 'GOVERNANCE',
+    retainUntilDate: objectSemantics.extractXmlValue(body, 'RetainUntilDate') ?? metadata.objectLock?.retainUntilDate,
   };
   await ctx.state!.putObjectMetadata(metadata);
   return sendEmpty(ctx, 200);
@@ -702,7 +704,7 @@ async function handleCreateMultipartUpload(ctx: S3RequestContext) {
     bucket: ctx.bucketName!,
     key: ctx.key,
     contentType: ctx.headers['content-type'],
-    metadata: collectUserMetadata(ctx.headers),
+    metadata: objectSemantics.collectUserMetadata(ctx.headers),
   });
   return sendXml(ctx, 200, createMultipartUploadXml(ctx.bucketName!, ctx.key, state.uploadId));
 }
@@ -715,14 +717,14 @@ async function handleUploadPart(ctx: S3RequestContext) {
   }
   const state = await requireMultipart(ctx, uploadId);
   if (!state) return;
-  const body = toBuffer(ctx.req.body);
+  const body = objectSemantics.toBuffer(ctx.req.body);
   const path = ctx.state!.multipartPartPath(ctx.bucketName!, uploadId, partNumber);
-  await ctx.client!.ensureCollection(path.slice(0, path.lastIndexOf('/')));
-  const resp = await ctx.client!.put(path, body, body.length);
+  await ctx.blobStore!.ensurePath(path.slice(0, path.lastIndexOf('/')));
+  const resp = await ctx.blobStore!.putRaw(path, body, body.length);
   if (![200, 201, 204].includes(resp.statusCode)) {
     return sendS3Error(ctx.reply, 'InternalError', `UploadPart failed: ${resp.statusCode}`, 500, ctx.requestId);
   }
-  const etag = `"${createWeakEtag(body)}"`;
+  const etag = `"${objectSemantics.createWeakEtag(body)}"`;
   state.parts = state.parts.filter((part) => part.partNumber !== partNumber).concat({ partNumber, etag, size: body.length, path });
   state.parts.sort((a, b) => a.partNumber - b.partNumber);
   await ctx.state!.putMultipartUpload(state);
@@ -733,7 +735,7 @@ async function handleCompleteMultipartUpload(ctx: S3RequestContext) {
   const uploadId = ctx.query.uploadId!;
   const state = await requireMultipart(ctx, uploadId);
   if (!state) return;
-  const requestedParts = parseCompleteMultipartBody(await requestBodyText(ctx.req.body));
+  const requestedParts = objectSemantics.parseCompleteMultipartBody(await objectSemantics.requestBodyText(ctx.req.body));
   const parts = requestedParts.length > 0
     ? requestedParts.map((partNumber) => state.parts.find((part) => part.partNumber === partNumber)).filter(Boolean)
     : state.parts;
@@ -742,12 +744,12 @@ async function handleCompleteMultipartUpload(ctx: S3RequestContext) {
   }
   const buffers: Buffer[] = [];
   for (const part of parts) {
-    const resp = await ctx.client!.get(part!.path);
+    const resp = await ctx.blobStore!.getRaw(part!.path);
     if (resp.statusCode >= 400) return sendS3Error(ctx.reply, 'InvalidPart', `Part ${part!.partNumber} is not readable`, 400, ctx.requestId);
     buffers.push(resp.body);
   }
   const finalBody = Buffer.concat(buffers);
-  const result = await putObject(ctx.client!, ctx.bucket!, ctx.key, finalBody, finalBody.length);
+  const result = await ctx.blobStore!.putObject(ctx.bucket!, ctx.key, finalBody, finalBody.length);
   await ctx.state!.deleteMultipartUpload(ctx.bucketName!, uploadId);
   return sendXml(ctx, 200, completeMultipartUploadXml(ctx.bucketName!, ctx.key, result.etag));
 }
@@ -778,7 +780,7 @@ async function requireObjectMetadata(ctx: S3RequestContext): Promise<ObjectMetad
   const metadata = await ctx.state!.getObjectMetadata(ctx.bucketName!, ctx.key);
   if (metadata) return metadata;
   try {
-    const head = await headObject(ctx.client!, ctx.bucket!, ctx.key);
+    const head = await ctx.blobStore!.headObject(ctx.bucket!, ctx.key);
     return {
       bucket: ctx.bucketName!,
       key: ctx.key,
@@ -888,130 +890,8 @@ function responseOverrideHeaders(query: Record<string, string | undefined>): Rec
   );
 }
 
-function collectUserMetadata(headers: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(headers)
-      .filter(([key]) => key.startsWith('x-amz-meta-'))
-      .map(([key, value]) => [key.slice('x-amz-meta-'.length), value]),
-  );
-}
-
-function buildObjectMetadata(
-  ctx: S3RequestContext,
-  etag: string,
-  size: number,
-  tagging: Record<string, string>,
-  source?: ObjectMetadataState,
-  versionId?: string,
-): ObjectMetadataState {
-  return {
-    bucket: ctx.bucketName!,
-    key: ctx.key,
-    etag,
-    size,
-    lastModified: new Date().toISOString(),
-    contentType: ctx.headers['content-type'] ?? source?.contentType ?? 'application/octet-stream',
-    userMetadata: Object.keys(collectUserMetadata(ctx.headers)).length > 0 ? collectUserMetadata(ctx.headers) : source?.userMetadata ?? {},
-    tagging,
-    storageClass: ctx.headers['x-amz-storage-class'] ?? source?.storageClass,
-    checksum: collectChecksums(ctx.headers),
-    versionId: versionId ?? source?.versionId,
-    objectLock: source?.objectLock,
-  };
-}
-
-function metadataHeaders(metadata: ObjectMetadataState | null): Record<string, string> {
-  if (!metadata) return {};
-  return {
-    'content-type': metadata.contentType,
-    'content-length': String(metadata.size),
-    etag: metadata.etag,
-    'last-modified': new Date(metadata.lastModified).toUTCString(),
-    ...(metadata.storageClass ? { 'x-amz-storage-class': metadata.storageClass } : {}),
-    ...(metadata.versionId ? { 'x-amz-version-id': metadata.versionId } : {}),
-    ...(metadata.isDeleteMarker ? { 'x-amz-delete-marker': 'true' } : {}),
-    ...Object.fromEntries(Object.entries(metadata.userMetadata).map(([key, value]) => [`x-amz-meta-${key}`, value])),
-    ...Object.fromEntries(Object.entries(metadata.checksum ?? {}).map(([key, value]) => [`x-amz-checksum-${key}`, value])),
-  };
-}
-
-function evaluateObjectConditions(headers: Record<string, string>, metadata: ObjectMetadataState | null): { status?: 304 | 412 } {
-  if (!metadata) return {};
-  const etag = metadata.etag;
-  const modifiedAt = new Date(metadata.lastModified).getTime();
-  if (headers['if-match'] && !matchEtags(headers['if-match'], etag)) return { status: 412 };
-  if (headers['if-none-match'] && matchEtags(headers['if-none-match'], etag)) return { status: headers['if-none-match'] ? 304 : 412 };
-  if (headers['if-unmodified-since'] && modifiedAt > Date.parse(headers['if-unmodified-since'])) return { status: 412 };
-  if (headers['if-modified-since'] && modifiedAt <= Date.parse(headers['if-modified-since'])) return { status: 304 };
-  return {};
-}
-
-function evaluateCopySourceConditions(headers: Record<string, string>, metadata: ObjectMetadataState | null): { status?: 412 } {
-  if (!metadata) return {};
-  const etag = metadata.etag;
-  const modifiedAt = new Date(metadata.lastModified).getTime();
-  if (headers['x-amz-copy-source-if-match'] && !matchEtags(headers['x-amz-copy-source-if-match'], etag)) return { status: 412 };
-  if (headers['x-amz-copy-source-if-none-match'] && matchEtags(headers['x-amz-copy-source-if-none-match'], etag)) return { status: 412 };
-  if (headers['x-amz-copy-source-if-unmodified-since'] && modifiedAt > Date.parse(headers['x-amz-copy-source-if-unmodified-since'])) return { status: 412 };
-  if (headers['x-amz-copy-source-if-modified-since'] && modifiedAt <= Date.parse(headers['x-amz-copy-source-if-modified-since'])) return { status: 412 };
-  return {};
-}
-
-function isObjectLocked(metadata: ObjectMetadataState | null): boolean {
-  if (!metadata?.objectLock) return false;
-  if (metadata.objectLock.legalHold === 'ON') return true;
-  if (!metadata.objectLock.retainUntilDate) return false;
-  const retainUntil = Date.parse(metadata.objectLock.retainUntilDate);
-  return Number.isFinite(retainUntil) && retainUntil > Date.now();
-}
-
-function matchEtags(condition: string, etag: string): boolean {
-  return condition.split(',').map((item) => item.trim()).some((item) => item === '*' || item === etag || item.replace(/^W\//, '') === etag);
-}
-
-function validateChecksums(headers: Record<string, string>, body: Buffer): { code: string; message: string } | null {
-  const contentMd5 = headers['content-md5'];
-  if (contentMd5 && createHash('md5').update(body).digest('base64') !== contentMd5) {
-    return { code: 'BadDigest', message: 'The Content-MD5 you specified did not match what we received' };
-  }
-  const sha256 = headers['x-amz-checksum-sha256'];
-  if (sha256 && createHash('sha256').update(body).digest('base64') !== sha256) {
-    return { code: 'BadDigest', message: 'The x-amz-checksum-sha256 you specified did not match what we received' };
-  }
-  return null;
-}
-
-function collectChecksums(headers: Record<string, string>): Record<string, string> | undefined {
-  const entries = Object.entries(headers)
-    .filter(([key]) => key.startsWith('x-amz-checksum-'))
-    .map(([key, value]) => [key.slice('x-amz-checksum-'.length), value]);
-  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
-}
-
-function parseTaggingHeader(header: string | undefined): Record<string, string> {
-  if (!header) return {};
-  return Object.fromEntries(new URLSearchParams(header));
-}
-
-function parseTaggingXml(xml: string): Record<string, string> {
-  const tags: Record<string, string> = {};
-  for (const match of xml.matchAll(/<Tag>\s*<Key>([\s\S]*?)<\/Key>\s*<Value>([\s\S]*?)<\/Value>\s*<\/Tag>/g)) {
-    tags[unescapeXml(match[1])] = unescapeXml(match[2]);
-  }
-  return tags;
-}
-
-function unescapeXml(value: string): string {
-  return value.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
-}
-
-function extractXmlValue(xml: string, tagName: string): string | undefined {
-  const match = new RegExp(`<${tagName}>([\\s\\S]*?)</${tagName}>`).exec(xml);
-  return match ? unescapeXml(match[1]) : undefined;
-}
-
 function isPostPolicyUpload(ctx: S3RequestContext): boolean {
-  const body = toBuffer(ctx.req.body).toString('utf-8').toLowerCase();
+  const body = objectSemantics.toBuffer(ctx.req.body).toString('utf-8').toLowerCase();
   return ctx.headers['content-type']?.toLowerCase().includes('multipart/form-data') === true && body.includes('x-amz-credential');
 }
 
@@ -1020,7 +900,7 @@ function parsePostPolicyFields(body: unknown): Record<string, string | undefined
 }
 
 function parsePostPolicyForm(body: unknown): { fields: Record<string, string>; file?: { filename?: string; body: Buffer } } {
-  const buffer = toBuffer(body);
+  const buffer = objectSemantics.toBuffer(body);
   const fields: Record<string, string> = {};
   const marker = Buffer.from('\r\n\r\n');
   const segments = buffer.toString('binary').split(/\r\n--[^\r\n]+/g);
@@ -1049,67 +929,6 @@ function trimMultipartPartBody(body: Buffer): Buffer {
   return body.slice(0, end);
 }
 
-function decodeStreamingPayloadIfNeeded(headers: Record<string, string>, body: unknown): Buffer {
-  const buffer = toBuffer(body);
-  const payloadMarker = headers['x-amz-content-sha256'];
-  if (!payloadMarker?.startsWith('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) return buffer;
-  return decodeAwsChunkedBody(buffer);
-}
-
-function decodeAwsChunkedBody(body: Buffer): Buffer {
-  const chunks: Buffer[] = [];
-  let offset = 0;
-  while (offset < body.length) {
-    const lineEnd = body.indexOf('\r\n', offset, 'utf-8');
-    if (lineEnd === -1) return body;
-    const header = body.slice(offset, lineEnd).toString('utf-8');
-    const sizeHex = header.split(';')[0];
-    const size = parseInt(sizeHex, 16);
-    if (!Number.isFinite(size)) return body;
-    offset = lineEnd + 2;
-    if (size === 0) break;
-    chunks.push(body.slice(offset, offset + size));
-    offset += size + 2;
-  }
-  return Buffer.concat(chunks);
-}
-
-function toBuffer(body: unknown): Buffer {
-  if (Buffer.isBuffer(body)) return body;
-  if (typeof body === 'string') return Buffer.from(body);
-  return Buffer.from([]);
-}
-
-async function requestBodyText(body: unknown): Promise<string> {
-  return toBuffer(body).toString('utf-8');
-}
-
-async function readableToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
-function safeJsonParse(body: string): unknown | null {
-  try {
-    return JSON.parse(body);
-  } catch {
-    return null;
-  }
-}
-
-function parseCompleteMultipartBody(xml: string): number[] {
-  return [...xml.matchAll(/<PartNumber>(\d+)<\/PartNumber>/g)].map((match) => Number(match[1]));
-}
-
-function parseDeleteObjectsBody(xml: string): string[] {
-  return [...xml.matchAll(/<Object>[\s\S]*?<Key>([\s\S]*?)<\/Key>[\s\S]*?<\/Object>/g)]
-    .map((match) => unescapeXml(match[1] ?? ''))
-    .filter((key) => key.length > 0);
-}
-
 function deleteObjectsXml(
   deleted: Array<{ key: string; versionId?: string; deleteMarker?: boolean }>,
   errors: Array<{ key: string; code: string; message: string }>,
@@ -1133,16 +952,6 @@ function deleteObjectsXml(
 <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
 ${body}
 </DeleteResult>`;
-}
-
-function createWeakEtag(body: Buffer): string {
-  let hash = 0;
-  for (const byte of body) hash = ((hash << 5) - hash + byte) | 0;
-  return Math.abs(hash).toString(16).padStart(8, '0');
-}
-
-function createVersionId(bucket: string, key: string): string {
-  return createHash('sha256').update(`${bucket}/${key}/${Date.now()}/${Math.random()}`).digest('hex');
 }
 
 function createMultipartUploadXml(bucket: string, key: string, uploadId: string): string {
